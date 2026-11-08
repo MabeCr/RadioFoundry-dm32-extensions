@@ -18,6 +18,9 @@ CONFIG_DISPLAY_INSET_LEFT ?= 10
 CONFIG_DISPLAY_INSET_RIGHT ?= 10
 CONFIG_DISPLAY_INSET_TOP ?= 5
 CONFIG_DISPLAY_INSET_BOTTOM ?= 5
+# The SNMP agent is a business feature (the Amateur variant leaves it out too) and costs about 3.3 KB of main RAM,
+# which this radio needs for other features
+CONFIG_SNMP ?= n
 # VOX reads the microphone level through hal_power_t.mic_level, which this board doesn't have yet
 CONFIG_VOX ?= n
 # The platform's three TCP connections; a fourth costs about 1.4 KB of main RAM. ci's maximal configuration has
