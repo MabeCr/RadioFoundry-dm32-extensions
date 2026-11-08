@@ -113,7 +113,7 @@ is `tools/bringup.py list --radio <id>`.
 | `tftp_iddb` | not recorded | not recorded | not recorded | not recorded | not recorded | not recorded |
 | `dmr_iddb` | not recorded | not recorded | not recorded | not recorded | not recorded | not recorded |
 | `iddb_compact` | not recorded | not recorded | not recorded | not recorded | not recorded | not recorded |
-| `snmp` | not recorded | not recorded | not recorded | not recorded | not recorded | not recorded |
+| `snmp` | off | not recorded | not recorded | not recorded | not recorded | not recorded |
 | `net_ppp` | not recorded | off | pass (seed) | pass (seed) | off | off |
 | `ui_navigation` | not recorded | not recorded | not recorded | not recorded | not recorded | not recorded |
 | `key_lock` | not recorded | not recorded | not recorded | not recorded | not recorded | not recorded |
@@ -192,7 +192,7 @@ clock`; ? = not known yet). No driver reads the clock yet ([radio-features.md](s
 | `TFTP_IDDB` | ● | ● | ● | ● | ● | ● |
 | `IDDB_COMPACT` | ● | ● | ● | ● | ● | ● |
 | `DMR_CONTROL_STATION` | ● | ● | ● | ● | ● | ● |
-| `SNMP` | ● | ● | ● | ● | ● | ● |
+| `SNMP` | ○ | ● | ● | ● | ● | ● |
 | `SFR` | ● | ● | ● | ● | ✕ | ● |
 | `SFR_DUALPATH_RX` | ● | ● | ● | ● | ✕ | ● |
 | `SFR_CWID` | ● | ● | ● | ● | ✕ | ● |
