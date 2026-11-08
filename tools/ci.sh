@@ -398,7 +398,7 @@ build() {
 	if ! make BOARD="$b" BUILD="$dir" -j"$JOBS" "$@" > "$log" 2>&1; then
 		grep -E 'error|undefined' "$log" | head -10
 		bad "$b $name: build failed ($*; see $log)"
-		echo "| $b | $name | build failed | | | | |" >> "$REPORT"
+		echo "| $b | $name | build failed | | | | | | |" >> "$REPORT"
 		return
 	fi
 	if grep -qi 'warning:' "$log"; then
@@ -427,14 +427,24 @@ build() {
 		# the app region's fit: the linker fails on an overflow; this catches a log it couldn't be read from
 		[ -n "$size" ] && [ -n "$used" ] && bad "$b $name: $used bytes used in a $size byte app region"
 	fi
+	# the same for RAM: "RAM:  98304 B  211456 B  46.49%" is what the linker places statically (.data, .bss and RAM
+	# code, so the heap and task stacks when they are static arrays); a board with no RAM line gets "?"
+	set -- $(grep -E '^ *RAM:' "$log" | head -1)
+	rused=$(tobytes "${2:-}" "${3:-}"); rsize=$(tobytes "${4:-}" "${5:-}")
+	if [ -n "$rsize" ] && [ -n "$rused" ] && [ "$rused" -le "$rsize" ] 2>/dev/null; then
+		rfree=$((rsize - rused))
+		rpct=$(awk "BEGIN { printf \"%.1f\", 100 * $rused / $rsize }")
+	else
+		rfree="?"; rpct="?"
+	fi
 	delta=""
 	if [ "$name" = default ]; then
 		default_bytes=$bytes
 	elif [ -n "${default_bytes:-}" ]; then
 		delta=$((bytes - default_bytes))
 	fi
-	echo "| $b | $name | $bytes | $delta | $free | $pct % |" >> "$REPORT"
-	ok "$b $name: $bytes bytes, $free bytes free in the app region"
+	echo "| $b | $name | $bytes | $delta | $free | $pct % | $rfree | $rpct % |" >> "$REPORT"
+	ok "$b $name: $bytes bytes, $free bytes free in the app region, $rfree bytes of RAM free"
 	# a tree that failed (warnings, stack check) stays for debugging
 	if [ "${RFOUNDRY_CI_PRUNE:-1}" != 0 ] && [ "$FAILED" = "$failed_before" ]; then
 		cp "$bin" "$dir.bin" && rm -rf "$dir"
@@ -458,10 +468,11 @@ if step firmware; then
 	echo "# Image sizes ($(git rev-parse --short=8 HEAD 2>/dev/null), $(date '+%Y-%m-%d %H:%M'))"
 	echo
 	echo "Bytes of the .bin; delta against the board's default; free = the linker's app FLASH region minus used (the"
-	echo "codec windows are outside that region)."
+	echo "codec windows are outside that region). RAM free = the linker's RAM region minus what it places statically"
+	echo "(.data, .bss, RAM code); the stack check covers the task stacks."
 	echo
-	echo "| Board | Config | Image bytes | Delta | Free | Used |"
-	echo "|---|---|---|---|---|---|"
+	echo "| Board | Config | Image bytes | Delta | Free | Used | RAM free | RAM used |"
+	echo "|---|---|---|---|---|---|---|---|"
 } > "$REPORT"
 
 for bm in boards/*/board.mk boards/*/; do

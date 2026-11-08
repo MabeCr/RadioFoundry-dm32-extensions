@@ -84,8 +84,8 @@ variants (`VARIANT=`, [build-config.md](../build-config.md)), which choose featu
 Each board's code space and the codec sectors that end it are in [release.md, "Sector maps"](release.md#sector-maps).
 
 The linker's application region ends before the codec, so an image that grows into it fails to link. The current figures and each feature's cost are in
-[feature-matrix.md](../feature-matrix.md). `tools/ci.sh` writes every configuration's size and free space to
-`build/ci/size-report.md`.
+[feature-matrix.md](../feature-matrix.md). `tools/ci.sh` writes every configuration's size, free flash and free RAM to
+`build/ci/size-report.md`. The RAM figure is what the linker places statically (data, bss, RAM code); the stack check covers task stacks.
 
 ## Flashing
 
