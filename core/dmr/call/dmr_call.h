@@ -86,6 +86,14 @@ typedef struct {
 // voice_index 0-5 = A-F (docs/spec/gotchas.md 6.1, 6.2)
 typedef void (*dmr_privacy_fn)(uint8_t ambe27[DMR_VOICE_BYTES], uint8_t voice_index, bool tx, void *ctx);
 
+// The information octets of a PI header (TS 102 361-1 7.1.2), without its CRC
+#define DMR_PI_BYTES 10
+
+// PI header hook (RX): a call whose PI header was heard is played only if this returns true. The hook gets the PI
+// octets once per header, before the call's first voice burst, so it can set up its keystream state in ctx (the same
+// ctx the privacy hook gets). NULL, or false: the call is not played (an MI-based scheme with no decryptor)
+typedef bool (*dmr_pi_fn)(const uint8_t pi[DMR_PI_BYTES], void *ctx);
+
 typedef struct {
 	uint32_t own_id;
 	uint8_t cc;			// 0-15
@@ -103,6 +111,7 @@ typedef struct {
 	uint8_t tx_fid;			// voice LC FID (privacy schemes: 0x10)
 	uint8_t tx_svc;			// voice LC service options (privacy bit, emergency, priority)
 	dmr_privacy_fn privacy;		// NULL = none: bursts with PI set are not played
+	dmr_pi_fn pi_accept;		// NULL = a call with a PI header is never played
 	void *privacy_ctx;
 	char tx_alias[DMR_TA_TEXT_MAX + 1];	// our talker alias, "" = none (CONFIG_DMR_TALKER_ALIAS)
 	uint8_t tx_alias_format;	// DMR_TA_7BIT or DMR_TA_ISO8
@@ -136,6 +145,7 @@ typedef struct {
 	bool pi_header;		// a PI header (data type 0) was heard for this call
 	uint8_t pi_alg;		// its first two octets (algorithm and key ID in the DMRA layout; not interpreted)
 	uint8_t pi_key;
+	uint8_t pi_data[DMR_PI_BYTES];	// all of its information octets (zero-filled past what the burst held)
 	char alias[DMR_TA_TEXT_MAX + 1];	// talker alias so far, "" if none
 	bool alias_complete;
 	bool gps_valid;		// a GPS Info LC was heard from this talker (CONFIG_DMR_GPS)

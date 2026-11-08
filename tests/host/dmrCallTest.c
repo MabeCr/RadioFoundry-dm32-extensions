@@ -1756,6 +1756,76 @@ static void rx_pi_header_burst(const uint8_t info[10], uint8_t cc, bool good_crc
 	sim_rx(&b);
 }
 
+static unsigned pi_accept_calls;
+static uint8_t pi_accept_seen[DMR_PI_BYTES];
+static bool pi_accept_answer;
+static bool pi_accept(const uint8_t pi[DMR_PI_BYTES], void *ctx)
+{
+	(void)ctx;
+	pi_accept_calls++;
+	memcpy(pi_accept_seen, pi, sizeof(pi_accept_seen));
+	return pi_accept_answer;
+}
+
+// The PI hook: a call whose PI header it takes is played through the privacy hook, once per header; one it refuses,
+// or no hook at all, is never played
+static void test_pi_hook(void)
+{
+	dmr_call_config_t c = base_cfg();
+	uint8_t lc[9];
+	static const uint8_t info[10] = { 0x21, 0x05, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0x5B, 0x00 };
+	unsigned frame = 1;
+
+	c.privacy = privacy_xor;
+	c.pi_accept = pi_accept;
+	pi_accept_answer = true;
+	pi_accept_calls = 0;
+	setup(&c);
+	mk_lc(lc, 0, TG_TALK, 9997030);
+	rx_header(lc, 1, 0, DMR_SYNC_MS, false);
+	run_ms(60);
+	rx_pi_header_burst(info, 1, true);
+	run_ms(60);
+	CHECK(pi_accept_calls == 1 && memcmp(pi_accept_seen, info, sizeof(info)) == 0);
+	CHECK(memcmp(V()->caller.pi_data, info, sizeof(info)) == 0);
+	privacy_calls = 0;
+	rx_call(lc, 1, false, 0, 1, true, &frame);
+	CHECK(sink_log.frames == 18 && privacy_calls == 6 && pi_accept_calls == 1);
+
+	// PI header heard before the call (late entry): the hook is asked when the call is acquired
+	run_ms(1000);
+	setup(&c);
+	pi_accept_calls = 0;
+	mk_lc(lc, 0, TG_TALK, 9997006);
+	rx_pi_header_burst(info, 1, true);
+	run_ms(60);
+	CHECK(pi_accept_calls == 0);
+	rx_call(lc, 1, false, 0, 1, false, &frame);
+	CHECK(pi_accept_calls == 1 && memcmp(V()->caller.pi_data, info, sizeof(info)) == 0 && sink_log.frames > 0);
+
+	// Refused: nothing plays and the burst is counted as dropped
+	pi_accept_answer = false;
+	setup(&c);
+	mk_lc(lc, 0, TG_TALK, 9997030);
+	rx_header(lc, 1, 0, DMR_SYNC_MS, false);
+	run_ms(60);
+	rx_pi_header_burst(info, 1, true);
+	run_ms(60);
+	rx_call(lc, 1, false, 0, 1, true, &frame);
+	CHECK(sink_log.frames == 0 && V()->caller.encrypted);
+
+	// No PI hook: as before
+	c.pi_accept = NULL;
+	setup(&c);
+	mk_lc(lc, 0, TG_TALK, 9997030);
+	rx_header(lc, 1, 0, DMR_SYNC_MS, false);
+	run_ms(60);
+	rx_pi_header_burst(info, 1, true);
+	run_ms(60);
+	rx_call(lc, 1, false, 0, 1, true, &frame);
+	CHECK(sink_log.frames == 0);
+}
+
 static void test_pi_header_and_emergency(void)
 {
 	dmr_call_config_t c = base_cfg();
@@ -2456,6 +2526,7 @@ int main(void)
 	test_tx_alias();
 	test_alias_formats();
 	test_pi_header_and_emergency();
+	test_pi_hook();
 	test_private_calls();
 	test_basic_privacy();
 	test_gps_lc();

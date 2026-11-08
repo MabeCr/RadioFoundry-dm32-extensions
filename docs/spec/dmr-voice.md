@@ -202,8 +202,11 @@ set it.
 
 PI header (data type 0, CRC-CCITT masked 0x6969): heard between the voice LC header and burst A, it marks the call
 encrypted and its first two octets are kept for display (algorithm and key ID in the common layout; not interpreted).
-A PI header heard just before a late entry is attached to that call. A PI header means an MI-based scheme the static
-keystream can't undo, so such a call is never played, key or not. We never send PI headers.
+A PI header heard just before a late entry is attached to that call. All ten information octets are kept
+(`pi_data`). A PI header means an MI-based scheme the static keystream can't undo, so such a call is never played, key
+or not, unless the call stack's PI hook (`pi_accept` in `dmr_call_config_t`) takes it. The hook gets the ten octets once
+per header, before the call's first voice burst, and returns whether it can decrypt the call. If it does, the voice
+bursts go through the privacy hook as for the static schemes. We never send PI headers.
 
 The HR_C6000 reports the EMB PI bit unreliably for voice, so its driver clears it (`modem-hrc6000.md`); on that modem
 privacy is recognized from the service options and PI headers only.

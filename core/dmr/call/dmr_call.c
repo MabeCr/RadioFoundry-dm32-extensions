@@ -113,6 +113,8 @@ static struct {
 	bool pi_pending;
 	uint32_t pi_pending_ms;
 	uint8_t pi_pending_alg, pi_pending_key;
+	uint8_t pi_pending_data[DMR_PI_BYTES];
+	bool pi_ok;		// the PI hook took this call's PI header: its voice is decrypted and played
 
 	// repeater outbound
 	uint32_t rpt_last_ms;
@@ -581,10 +583,14 @@ static void rx_lc(const uint8_t lc[DMR_LC_BYTES], const dmr_burst_t *b, bool lat
 	if (!continuing) {
 		c->pi_header = false;
 		c->pi_alg = c->pi_key = 0;
+		memset(c->pi_data, 0, sizeof(c->pi_data));
+		s.pi_ok = false;
 		if (s.pi_pending && !elapsed(now, s.pi_pending_ms, true, fade_ms())) {
 			c->pi_header = true;	// heard just before the call was acquired
 			c->pi_alg = s.pi_pending_alg;
 			c->pi_key = s.pi_pending_key;
+			memcpy(c->pi_data, s.pi_pending_data, sizeof(c->pi_data));
+			s.pi_ok = s.cfg.pi_accept && s.cfg.pi_accept(c->pi_data, s.cfg.privacy_ctx);
 			c->encrypted = true;
 		}
 #if CONFIG_SFR
@@ -672,8 +678,9 @@ static void rx_play(const dmr_burst_t *b, uint32_t now, uint32_t slot)
 		stats.rx_encrypted_calls++;
 		s.dirty = true;
 	}
-	// No key, or a PI header: an MI-based scheme the static key hook can't undo (docs/spec/gotchas.md 6.4)
-	if (enc && (!s.cfg.privacy || s.view.caller.pi_header)) {
+	// No key, or a PI header the PI hook didn't take: an MI-based scheme the static key hook can't undo
+	// (docs/spec/gotchas.md 6.4)
+	if (enc && (!s.cfg.privacy || (s.view.caller.pi_header && !s.pi_ok))) {
 		stats.rx_enc_dropped++;
 		TR_WHAT('e');
 		sink_lost(DMR_AMBE_FRAMES_PER_BURST);	// no key: never play the scrambled voice
@@ -893,8 +900,9 @@ static void rx_embedded(const dmr_burst_t *b, uint32_t now)
 }
 
 // A PI header (data type 0, TS 102 361-1 7.1.2): 80 bits of privacy information and a CRC-CCITT masked 0x6969. It
-// marks the call as protected; the octets are kept for the screens and the debug link but not interpreted (the
-// static key schemes need none, MI-based ones would, docs/spec/gotchas.md 6.4). It comes between the voice LC header
+// marks the call as protected; the octets are kept for the screens and the debug link and handed to the PI hook
+// (cfg.pi_accept), which decides whether it can decrypt the call (the static key schemes need none, MI-based ones
+// do, docs/spec/gotchas.md 6.4). It comes between the voice LC header
 // and burst A, so the call it belongs to is usually running; if not (header missed), it is held for the late entry
 static void rx_pi_header(const dmr_burst_t *b, uint32_t now)
 {
@@ -908,11 +916,16 @@ static void rx_pi_header(const dmr_burst_t *b, uint32_t now)
 	if (!ok || b->len < 2)
 		return;
 	stats.rx_pi_headers++;
+
+	uint8_t data[DMR_PI_BYTES] = { 0 };
+
+	memcpy(data, b->payload, b->len < DMR_PI_BYTES ? b->len : DMR_PI_BYTES);
 	if (s.rx == RXC_NONE) {
 		s.pi_pending = true;
 		s.pi_pending_ms = now;
 		s.pi_pending_alg = b->payload[0];
 		s.pi_pending_key = b->payload[1];
+		memcpy(s.pi_pending_data, data, sizeof(data));
 		return;
 	}
 
@@ -923,6 +936,8 @@ static void rx_pi_header(const dmr_burst_t *b, uint32_t now)
 	c->pi_header = true;
 	c->pi_alg = b->payload[0];
 	c->pi_key = b->payload[1];
+	memcpy(c->pi_data, data, sizeof(data));
+	s.pi_ok = s.cfg.pi_accept && s.cfg.pi_accept(data, s.cfg.privacy_ctx);
 	c->encrypted = true;
 	s.dirty = true;
 }
