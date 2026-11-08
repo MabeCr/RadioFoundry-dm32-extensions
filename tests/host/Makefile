@@ -26,7 +26,7 @@ FRAME   := $(CORE)/hotspot/dmrDataFrame.c $(CORE)/dmr/fec/dmrFec.c
 
 TSHARK  ?= $(firstword $(wildcard /Applications/Wireshark*.app/Contents/MacOS/tshark) $(shell command -v tshark))
 
-TESTS   := dmrFecTest sfrTest dmrDataTest dmrDataServiceTest hotspotDataTest hotspotUplinkTest dmrPrivacyTest \
+TESTS   := dmrFecTest sfrTest dmrDataTest dmrDataServiceTest hotspotDataTest hotspotUplinkTest dmrPrivacyTest dmrRc4Test \
            ipGatewayTest ipGatewayTest16 ipGatewayTest31 ipGatewayTestShared ipGatewayTestAir440
 
 all: run
@@ -103,6 +103,9 @@ TESTS   += zoneShareTest
 zoneShareTest: zoneShareTest.c fuzz.h $(CORE)/dmr/zoneShare.c $(CORE)/dmr/zoneShare.h
 	$(CC) $(CFLAGS) -Wshadow -o $@ zoneShareTest.c $(CORE)/dmr/zoneShare.c
 
+dmrRc4Test: dmrRc4Test.c $(CORE)/dmr/dmrRc4.c $(CORE)/dmr/dmrRc4.h
+	$(CC) $(CFLAGS) -o $@ dmrRc4Test.c $(CORE)/dmr/dmrRc4.c
+
 dmrPrivacyTest: dmrPrivacyTest.c $(CORE)/dmr/dmrPrivacy.c $(CORE)/dmr/dmrPrivacy.h $(CORE)/dmr/ambe/ambeFec.c
 	$(CC) $(CFLAGS) -o $@ dmrPrivacyTest.c $(CORE)/dmr/dmrPrivacy.c $(CORE)/dmr/ambe/ambeFec.c
 
@@ -128,6 +131,7 @@ run: $(TESTS)
 	./hotspotDataTest
 	./hotspotUplinkTest
 	./dmrPrivacyTest
+	./dmrRc4Test
 	./lrrpTest
 	./airQueueTest
 	./zoneShareTest
