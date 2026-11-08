@@ -1,0 +1,248 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 The RadioFoundry Authors
+#
+# Firmware releases (docs/dev/release.md): on a v* tag, build the codec-less firmware for every releasable radio
+# (board.toml [status] release = "stable", each build option value's image too) with the toolchains platform.toml
+# pins, one job per toolchain (C-SKY in the csky-elf image, never built from source), write a manifest and SHA256SUMS
+# for each image, build rfoundry as single-file executables for Linux, macOS and Windows, and attach everything to
+# the GitHub release (created when missing; the user manual workflow attaches its PDF to the same release). The AMBE
+# codec is never part of any of it.
+#
+# Pull requests touching rfoundry or what it bundles build rfoundry as workflow artifacts and publish nothing. The
+# firmware packaging runs on a pull request only when this file or the toolchain action changes: otherwise
+# pr-tests.yml's firmware jobs run tools/release_build.sh for a pull request that changes the packaging or a board, in
+# a job they run anyway. The release gate (tools/ci.sh) runs for a tag only, since a pull request's own checks already
+# ran it. Every job runs on GitHub's hosted runners (docs/dev/ci-runners.md).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "tools/rfoundry/**"   # a board.toml change rfoundry sees comes with its registry.json
+      - "tools/serial_loader.py"
+      - "tools/hrc7000_codec.py"
+      - "stub/stubtool.py"
+      - ".github/actions/**"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYINSTALLER_VERSION: "6.11.1"
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      publish: ${{ steps.v.outputs.publish }}
+      rfoundry: ${{ steps.v.outputs.rfoundry }}
+      firmware: ${{ steps.v.outputs.firmware }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          submodules: false
+          fetch-depth: 2   # a pull request's merge commit and main, its first parent
+          sparse-checkout: tools/release_version.py   # the tag's check
+          sparse-checkout-cone-mode: false
+      - id: v
+        run: |
+          # rfoundry's runners: GitHub's Linux, macOS and Windows runners
+          m='[{"os":"ubuntu-22.04","name":"linux-x86_64"},{"os":"macos-15","name":"macos-arm64"},'
+          m="$m"'{"os":"macos-15-intel","name":"macos-x86_64"},{"os":"windows-2022","name":"windows-x86_64","ext":".exe"}]'
+          echo "rfoundry=$m" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF_TYPE}" = tag ] && [ "${GITHUB_REF_NAME#v}" != "${GITHUB_REF_NAME}" ]; then
+            # a release name or nothing: vYY.M, vYY.M.N, either with bN (docs/dev/release.md)
+            python3 tools/release_version.py check "${GITHUB_REF_NAME}"
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dev-${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+          # a pull request runs the firmware jobs only for a change to them; pr-tests.yml packages the rest
+          fw=true
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            git diff --name-only HEAD^1 HEAD | grep -qE '^\.github/(actions/|workflows/release\.yml)' || fw=false
+          fi
+          echo "firmware=$fw" >> "$GITHUB_OUTPUT"
+
+  firmware:
+    # one job per toolchain: every releasable board built with it (board.toml [status] release = "stable") and each of
+    # its build option values' images (one per band, for example), all from the registry, so a new radio is released
+    # with no edit here. One artifact per toolchain
+    name: firmware (${{ matrix.name }})
+    needs: version
+    if: needs.version.outputs.firmware == 'true'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # the [toolchain] ids of platform/*/platform.toml, with their names; a new platform on a toolchain listed here
+        # needs no edit, a new toolchain gets an entry here and its set-up in .github/actions/toolchain
+        include:
+          - { toolchain: arm, name: Arm }
+          - { toolchain: csky, name: C-SKY }
+    permissions:
+      contents: read
+      packages: read   # pulling a private ghcr.io csky-elf image with the job token
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          submodules: false   # tools/checkout-submodules.sh: the runner image's copies, then the network
+          fetch-depth: 0
+      - name: third_party submodules
+        run: tools/checkout-submodules.sh
+      # the pinned compiler, as in CI: the self-hosted image's, the installed Arm toolchain, or the csky-elf image.
+      # Never built from source here: without the image the C-SKY release fails
+      - name: Toolchain (platform.toml [toolchain])
+        id: tc
+        uses: ./.github/actions/toolchain
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          image: ${{ vars.RFOUNDRY_CSKY_IMAGE }}
+          registry: ${{ vars.RFOUNDRY_CSKY_REGISTRY }}
+          registry-user: ${{ vars.RFOUNDRY_CSKY_REGISTRY_USER || github.actor }}
+          registry-token: ${{ secrets.RFOUNDRY_CSKY_REGISTRY_TOKEN || github.token }}
+
+      # the host tests and Python checks on the runner (the csky-elf image has no host compiler), the builds with the
+      # toolchain's compiler
+      - name: Release gate (host tests, Python checks, license checks, the toolchain's builds)
+        if: needs.version.outputs.publish == 'true'
+        env:
+          RUN: ${{ steps.tc.outputs.run }}   # empty, or the csky-elf image's run.sh
+          TOOLCHAIN: ${{ matrix.toolchain }}
+        run: |
+          set -u
+          tools/ci.sh --quick --steps registry,host,python,licenses
+          rc=0
+          $RUN tools/ci.sh --quick --steps firmware --toolchain "$TOOLCHAIN" || rc=$?
+          [ "$rc" != 3 ] || echo "::error::no $TOOLCHAIN compiler: the image ${RFOUNDRY_CSKY_IMAGE:-} isn't available on this runner (docs/dev/ci.md)"
+          exit "$rc"
+
+      - name: Build and package every releasable board
+        env:
+          RUN: ${{ steps.tc.outputs.run }}
+          TOOLCHAIN: ${{ matrix.toolchain }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -u
+          rc=0
+          $RUN tools/release_build.sh --toolchain "$TOOLCHAIN" --version "$VERSION" --out dist || rc=$?
+          if [ "$rc" = 3 ] && [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            # a pull request's packaging check runs on GitHub's runners, which can't pull the private csky-elf image
+            echo "::notice::$TOOLCHAIN packaging skipped: the image ${RFOUNDRY_CSKY_IMAGE:-} isn't available on this runner (docs/dev/ci.md)"
+            exit 0
+          fi
+          [ "$rc" != 3 ] || echo "::error::no $TOOLCHAIN compiler: the image ${RFOUNDRY_CSKY_IMAGE:-} isn't available on this runner (docs/dev/ci.md)"
+          exit "$rc"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
+        if: hashFiles('dist/*') != ''
+        with:
+          name: firmware-${{ matrix.toolchain }}
+          path: dist/
+          if-no-files-found: error
+
+  rfoundry:
+    needs: version
+    strategy:
+      fail-fast: false
+      # from the version job: ubuntu-22.04 (the oldest glibc we build on, so the binary runs on older distributions),
+      # macos-15 (macos-14 is being retired), macos-15-intel (macos-13 is retired; the last Intel image) and windows-2022
+      matrix:
+        include: ${{ fromJSON(needs.version.outputs.rfoundry) }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          submodules: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0   # v7.1.0
+        if: runner.environment != 'self-hosted'
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Python venv (the self-hosted image's Python 3.12; its system Python takes no pip installs)
+        if: runner.environment == 'self-hosted'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "pyinstaller==${PYINSTALLER_VERSION}" ./tools/rfoundry
+      - name: Test
+        run: python -W ignore -m unittest discover -s tools/rfoundry/tests -v
+      - name: Build the executable
+        run: |
+          set -eu
+          out="rfoundry-${{ needs.version.outputs.version }}-${{ matrix.name }}"
+          # the serial route (rfoundry/serialflash.py) imports these tools from the checkout; bundle them
+          pyinstaller --onefile --clean --name "$out" --paths tools/rfoundry --paths tools --paths stub \
+            --hidden-import serial_loader --hidden-import hrc7000_codec --hidden-import stubtool \
+            --collect-binaries libusb_package --collect-data certifi --hidden-import usb.backend.libusb1 \
+            --add-data "tools/rfoundry/rfoundry/codec_maps:rfoundry/codec_maps" \
+            --add-data "tools/rfoundry/rfoundry/registry.json:rfoundry" \
+            tools/rfoundry/rfoundry/__main__.py
+          "./dist/$out${{ matrix.ext }}" --version
+          "./dist/$out${{ matrix.ext }}" --help > /dev/null
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
+        with:
+          name: rfoundry-${{ matrix.name }}
+          path: dist/rfoundry-*
+          if-no-files-found: error
+
+  publish:
+    needs: [version, firmware, rfoundry]
+    if: needs.version.outputs.publish == 'true'   # and every toolchain's firmware and every rfoundry passed
+    runs-on: ubuntu-24.04   # a write token: GitHub's runners only (docs/dev/ci-runners.md)
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          submodules: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333   # v8.0.2
+        with:
+          path: artifacts
+      - name: Collect the files and one SHA256SUMS
+        run: |
+          set -eu
+          mkdir -p out
+          find artifacts -type f ! -name SHA256SUMS -exec cp {} out/ \;
+          (cd out && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+          # the manifests' own image hashes must agree with the files
+          for j in out/rfoundry-*.json; do
+            python3 - "$j" <<'EOF'
+          import hashlib, json, os, sys
+          m = json.load(open(sys.argv[1]))
+          img = os.path.join(os.path.dirname(sys.argv[1]), m["image"]["file"])
+          assert hashlib.sha256(open(img, "rb").read()).hexdigest() == m["image"]["sha256"], img
+          assert m["codec"]["included"] is False, "a release image must never include the codec"
+          print("manifest ok:", sys.argv[1])
+          EOF
+          done
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          TAG="${GITHUB_REF_NAME}"
+          NOTES="Firmware images for the radios listed below, without the AMBE codec, and rfoundry for Linux, macOS and
+          Windows. Flash with: rfoundry flash --release ${TAG}. rfoundry keeps the codec already in your radio when
+          that is known to be safe, or writes it from your radio's stock firmware file (--stock). See
+          docs/user/02-installing.md."
+          # a beta tag (bN) is a pre-release: the site's default install (the latest release) skips it
+          PRE=""
+          if python3 tools/release_version.py prerelease "$TAG"; then PRE=--prerelease; fi
+          gh release view "$TAG" > /dev/null 2>&1 || \
+            gh release create "$TAG" --verify-tag $PRE --generate-notes --title "RadioFoundry $TAG" --notes "$NOTES" || \
+            gh release view "$TAG" > /dev/null   # created meanwhile by the manual workflow
+          gh release upload "$TAG" out/* --clobber

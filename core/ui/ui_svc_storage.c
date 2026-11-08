@@ -1,0 +1,1138 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 The RadioFoundry Authors
+// The ui_svc.h calls storage-cps answers (docs/spec/settings-store.md, core/codeplug editing):
+//   - settings: each UI setting is read from where it is kept across power cycles. The radio core's own settings
+//     (key tones, tone volume, TX timeout, backlight time, battery saver) from radio_get_settings, which the radio
+//     core saves and restores itself (ui_svc_apply sends changes there); the preferences in settings_t (brightness,
+//     default squelch, hotspot allowed) directly; the DMR data service's answers (radio check, call alert, LRRP) from
+//     its settings, which the radio core saves; the UI's own (reply window, mic gain, auto lock, key timing, GPS
+//     options) from their settings_t fields. Settings nobody stores yet stay in the stub's RAM table.
+//   - save to channel, the permanent talk target and the factory reset: the UI task only takes a copy of what to
+//     write and hands a job to the housekeeping task (storage_job_post), so the UI never waits for a flash erase. The
+//     channel is written with codeplug_set_channel; the radio core re-reads it when codeplug_serial() changes. A job
+//     that fails tells the UI with a UI_EV_SAVE_FAILED event (a toast).
+#include <string.h>
+#include "board.h"
+#include "ui_svc.h"
+#include "i18n.h"
+#include "radio/radio.h"
+#include "settings/settings.h"
+#include "radio/ref_trim.h"
+#include "storage/storage.h"
+#include "codeplug/codeplug.h"
+#include "hal_time.h"
+#include "config.h"
+#if CONFIG_HOSTLINK
+#include "hostlink/hostlink.h"
+#endif
+#if CONFIG_DMR_DATA_CORE
+#include "dmr/dmr_data_api.h"
+#endif
+#if CONFIG_TFTP
+#include "net/tftp_codeplug.h"
+#endif
+#if CONFIG_ZONE_SHARE
+#include "dmr/zone_share_api.h"
+#endif
+#if CONFIG_DMR_PRIVACY
+#include "dmr/dmrPrivacy.h"
+#endif
+#if CONFIG_KEY_ASSIGN
+#include "input/input.h"
+#include "input/input_engine.h"
+#include "input/keyassign.h"
+#endif
+
+// The crash report's target is a contact number in 11 spare bits (settings.h)
+#if CONFIG_CRASH_REPORT
+_Static_assert(CODEPLUG_CONTACTS_MAX <= 0x7FF, "the crash report's target doesn't fit settings_crash_contact");
+#endif
+
+uint32_t ui_svc_feat_storage(void)
+{
+	return UI_FEAT_SAVE_CHANNEL | UI_FEAT_FACTORY_RESET;
+}
+
+static uint16_t clamp16(int32_t v, int32_t lo, int32_t hi)
+{
+	return (uint16_t)(v < lo ? lo : v > hi ? hi : v);
+}
+
+// The UI's on / off settings kept as settings_t.ui_flags bits (0: not one of them)
+static uint8_t ui_flag(uint8_t id)
+{
+	switch (id) {
+	case UI_SET_LARGE_TEXT: return SETTINGS_UI_LARGE_TEXT;
+	case UI_SET_HINTS: return SETTINGS_UI_HINTS;
+	case UI_SET_MESSAGE_TONE: return SETTINGS_UI_MESSAGE_TONE;
+	case UI_SET_ALIAS_SHOW: return SETTINGS_UI_ALIAS;
+	case UI_SET_PTT_LOCKED: return SETTINGS_UI_PTT_LOCKED;
+	case UI_SET_HEAR_ALL_DEFAULT: return SETTINGS_UI_HEAR_ALL;
+#if CONFIG_DUAL_WATCH
+	case UI_SET_DUAL_TALK_BACK: return SETTINGS_UI_DUAL_TALK_BACK;
+#endif
+	default: return 0;
+	}
+}
+
+static radio_view_t v;		// the radio's view (static: too big for the UI task's stack)
+
+#if CONFIG_DMR_PRIVACY
+// Privacy key slot 1 (settings-store.md 3.1), typed in on the radio. While privacy is on, the radio core holds the
+// key in use and writes it back to slot 1 itself, so it gets the new one too (type off turns privacy off)
+static void privacy_store(uint8_t type, uint32_t key)
+{
+	if (type >= DMR_PRIVACY_NUM_TYPES) {
+		type = DMR_PRIVACY_OFF;
+	}
+	if (type == DMR_PRIVACY_MOTOROLA_BP && (key < 1 || key > 255)) {
+		key = key == 0 ? 1 : 255;
+	}
+	key &= 0xFFFFu;
+	settings_t *st = settings_begin();
+	st->privacy_type[0] = type;
+	st->privacy_key[0] = type != DMR_PRIVACY_OFF ? key : 0;
+	if (type == DMR_PRIVACY_OFF && st->privacy_active == 1) {
+		st->privacy_active = 0;
+	}
+	settings_end(hal_millis());
+	radio_get_view(&v);
+	if (v.dmr.privacy) {
+		radio_req_dmr_privacy(type, (uint16_t)key);
+	}
+}
+#endif
+
+#if CONFIG_KEY_ASSIGN
+static int32_t key_get(uint8_t id);
+static bool key_set(uint8_t id, int32_t value);
+#endif
+
+#if CONFIG_DMR
+static bool dmr_id_post(uint32_t id);	// a job: the codeplug write is the housekeeping task's
+#endif
+
+int32_t ui_svc_setting_get(uint8_t id)
+{
+	radio_settings_t rs;
+	settings_t st;
+#if CONFIG_KEY_ASSIGN
+	if (id >= UI_SET_KEY_FIRST && id <= UI_SET_KEY_LAST) {
+		return key_get(id);
+	}
+#endif
+	switch (id) {
+	case UI_SET_KEY_TONES:
+	case UI_SET_TONE_VOLUME:
+	case UI_SET_TOT_S:
+	case UI_SET_BACKLIGHT_S:
+	case UI_SET_BATTERY_SAVER:
+		radio_get_settings(&rs);
+		if (id == UI_SET_KEY_TONES)
+			return rs.key_beep;
+		if (id == UI_SET_TONE_VOLUME)
+			return (rs.beep_level + 5) / 10;
+		if (id == UI_SET_TOT_S)
+			return rs.tot_s;
+		if (id == UI_SET_BACKLIGHT_S)
+			return rs.backlight_dim_s;
+		return rs.rx_save != 0;
+	case UI_SET_VOLUME:
+		settings_read(&st);
+		return radio_volume_step(st.volume);
+	case UI_SET_BRIGHTNESS:
+		settings_read(&st);
+		return st.brightness >= 10 && st.brightness <= 100 ? st.brightness : 100;
+	case UI_SET_SQUELCH:
+		settings_read(&st);
+		return st.squelch <= 9 ? st.squelch : ui_svc_ram_get(id);
+	case UI_SET_HOTSPOT_AUTO:
+		settings_read(&st);
+		return st.hotspot_allowed != 0;
+	case UI_SET_REPLY_S:
+		radio_get_settings(&rs);
+		return ui_svc_reply_shown(&rs);
+#if CONFIG_SFR
+	case UI_SET_SFR_RX:
+		radio_get_settings(&rs);
+		return rs.sfr_rx;
+#endif
+#if CONFIG_SFR_CWID
+	case UI_SET_SFR_CWID:
+		radio_get_settings(&rs);
+		return rs.sfr_cwid;
+#endif
+#if CONFIG_DUAL_WATCH
+	case UI_SET_DUAL_DELAY_MS:
+		radio_get_settings(&rs);
+		return rs.dual_delay_ms;
+#endif
+#if CONFIG_BCAST_FM
+	case UI_SET_BCAST_STEP:
+		radio_get_settings(&rs);
+		return rs.bcast_step == RADIO_BCAST_STEP_100 ? 100 : 200;
+#endif
+	case UI_SET_MIC_GAIN:
+		settings_read(&st);
+		return st.mic_gain <= 10 ? st.mic_gain : 5;
+	case UI_SET_REF_TRIM:
+		settings_read(&st);
+		return ref_trim_clamp(st.ref_trim_ppb);
+	case UI_SET_VFO_STEP:
+		settings_read(&st);
+		return st.vfo_step_hz >= 1000u && st.vfo_step_hz <= 1000000u ? (int32_t)(st.vfo_step_hz / 10u) : 0;
+#if CONFIG_DUAL_WATCH
+	case UI_SET_DUAL_B: {
+		settings_read(&st);
+		if (st.dual_b > UI_DUAL_B_VFO2)
+			return 0;
+		return st.dual_b | ((st.dual_state & SETTINGS_DUAL_ON) ? UI_DUAL_ON : 0) |
+		       ((st.dual_state & SETTINGS_DUAL_B_SEL) ? UI_DUAL_B_SEL : 0);
+	}
+#endif
+	case UI_SET_AUTO_LOCK_S:
+		settings_read(&st);
+		return st.auto_lock_s;
+	case UI_SET_LONG_PRESS_MS:
+		settings_read(&st);
+		return st.long_press_ms != 0 ? st.long_press_ms : ui_svc_ram_get(id);
+	case UI_SET_REPEAT_MS:
+		settings_read(&st);
+		return st.repeat_ms != 0 ? st.repeat_ms : ui_svc_ram_get(id);
+	case UI_SET_GPS:
+		settings_read(&st);
+		return st.gps != 0;
+	case UI_SET_POS_FORMAT:
+		settings_read(&st);
+		return st.pos_format <= 2 ? st.pos_format : 0;
+	case UI_SET_POS_SEND_S:
+		settings_read(&st);
+		return st.pos_send_s;
+	case UI_SET_LANGUAGE:
+		settings_read(&st);
+		return (int32_t)((uint8_t)st.lang[0] << 8 | (uint8_t)st.lang[1]);
+	case UI_SET_LARGE_TEXT:
+	case UI_SET_HINTS:
+	case UI_SET_MESSAGE_TONE:
+	case UI_SET_ALIAS_SHOW:
+	case UI_SET_PTT_LOCKED:
+	case UI_SET_HEAR_ALL_DEFAULT:
+#if CONFIG_DUAL_WATCH
+	case UI_SET_DUAL_TALK_BACK:
+#endif
+		settings_read(&st);
+		return (st.ui_flags & ui_flag(id)) != 0;
+	case UI_SET_VIBRATE:
+		settings_read(&st);
+		return (st.ui_flags & SETTINGS_UI_NO_VIBRATE) == 0;
+	case UI_SET_THEME:
+		settings_read(&st);
+		return settings_theme(&st);
+	case UI_SET_ACCENT:
+		settings_read(&st);
+		return st.accent & SETTINGS_ACCENT_COLOR;
+	case UI_SET_STRIP:
+		settings_read(&st);
+		return (st.accent & SETTINGS_ACCENT_PLAIN) == 0;
+	case UI_SET_UPDOWN_HOME:
+		settings_read(&st);
+		return settings_updown_home(&st);
+	case UI_SET_LOW_BATTERY:
+		settings_read(&st);
+		return st.low_batt_pct;
+	case UI_SET_AUTO_OFF_MIN:
+		settings_read(&st);
+		return st.auto_off_min;
+	case UI_SET_TALK_PERMIT:
+		radio_get_settings(&rs);
+		return rs.talk_permit;
+	case UI_SET_TFTP_WRITE:
+		settings_read(&st);
+		return (st.net_flags & SETTINGS_NET_TFTP_NO_WRITE) == 0;
+#if CONFIG_ZONE_SHARE
+	case UI_SET_ZONE_OFFERS:
+		settings_read(&st);
+		return settings_zs_accept(&st);
+#endif
+#if CONFIG_DMR
+	case UI_SET_DMR_ID:
+		return (int32_t)codeplug_dmr_id();
+#endif
+	case UI_SET_NOISE_REDUCTION:
+		settings_read(&st);
+		return (st.accent & SETTINGS_AUDIO_NO_NOISE_REDUCTION) == 0;
+	case UI_SET_MIC_AGC:
+		settings_read(&st);
+		return (st.accent & SETTINGS_AUDIO_AGC) != 0;
+#if CONFIG_DMR_ROAMING
+	case UI_SET_ROAM_SURVEY:
+	case UI_SET_ROAM_BEACON_S:
+	case UI_SET_ROAM_BEACON_LEN:
+	case UI_SET_ROAM_PROBE:
+		radio_get_settings(&rs);
+		return id == UI_SET_ROAM_SURVEY ? rs.roam_survey : id == UI_SET_ROAM_BEACON_S ? rs.roam_beacon_s :
+			id == UI_SET_ROAM_BEACON_LEN ? rs.roam_beacon_len_s : rs.roam_probe;
+#endif
+#if CONFIG_DMR_PRIVACY
+	case UI_SET_PRIVACY_TYPE:
+		settings_read(&st);
+		return st.privacy_type[0] < DMR_PRIVACY_NUM_TYPES ? st.privacy_type[0] : DMR_PRIVACY_OFF;
+	case UI_SET_PRIVACY_KEY:
+		settings_read(&st);
+		return (int32_t)(st.privacy_key[0] & 0xFFFFu);
+#endif
+#if CONFIG_DMR_DATA_CORE
+	case UI_SET_CHECK_REPLY:
+	case UI_SET_ALERT_ANSWER:
+	case UI_SET_POS_REPLY:
+	case UI_SET_MSG_FORMAT: {
+		dmrDataSettings_t ds;
+		dmr_data_get_settings(&ds);
+		if (id == UI_SET_MSG_FORMAT)
+			return ds.smsFormat;
+		return id == UI_SET_CHECK_REPLY ? ds.radioCheckReply : id == UI_SET_ALERT_ANSWER ? ds.callAlertAck :
+			ds.lrrpReply;
+	}
+#endif
+#if CONFIG_CRASH_REPORT
+	case UI_SET_CRASH_MODE:
+		settings_read(&st);
+		return settings_crash_mode(&st) <= UI_CRASH_SEND_AUTO ? settings_crash_mode(&st) : UI_CRASH_SEND_OFF;
+	case UI_SET_CRASH_CONTACT:
+		settings_read(&st);
+		return settings_crash_contact(&st);
+#endif
+#if CONFIG_USB_NETWORK && CONFIG_HOSTLINK
+	case UI_SET_USB_BOOT_NET:
+		settings_read(&st);
+		return st.usb_mode == 1;
+	case UI_SET_PC_ENDPOINT:
+		settings_read(&st);
+		return (st.net_flags & SETTINGS_NET_PASSTHROUGH) != 0;
+	case UI_SET_USB_FIXED_LINK:
+		settings_read(&st);
+		return (st.net_flags & SETTINGS_NET_FIXED_LINK) != 0;
+#endif
+	default:
+		return ui_svc_ram_get(id);
+	}
+}
+
+bool ui_svc_setting_set(uint8_t id, int32_t value)
+{
+	settings_t *st;
+#if CONFIG_KEY_ASSIGN
+	if (id >= UI_SET_KEY_FIRST && id <= UI_SET_KEY_LAST) {
+		return key_set(id, value);
+	}
+#endif
+	switch (id) {
+	case UI_SET_KEY_TONES:
+	case UI_SET_TONE_VOLUME:
+	case UI_SET_TOT_S:
+	case UI_SET_BACKLIGHT_S:
+	case UI_SET_BATTERY_SAVER:
+	case UI_SET_REPLY_S:
+	case UI_SET_TALK_PERMIT:
+#if CONFIG_SFR
+	case UI_SET_SFR_RX:
+#endif
+#if CONFIG_SFR_CWID
+	case UI_SET_SFR_CWID:
+#endif
+#if CONFIG_DUAL_WATCH
+	case UI_SET_DUAL_DELAY_MS:
+#endif
+#if CONFIG_BCAST_FM
+	case UI_SET_BCAST_STEP:
+#endif
+#if CONFIG_DMR_ROAMING
+	case UI_SET_ROAM_SURVEY:
+	case UI_SET_ROAM_BEACON_S:
+	case UI_SET_ROAM_BEACON_LEN:
+	case UI_SET_ROAM_PROBE:
+#endif
+		return true;	// ui_svc_apply hands it to the radio core, which saves it
+	case UI_SET_LARGE_TEXT:
+	case UI_SET_HINTS:
+	case UI_SET_MESSAGE_TONE:
+	case UI_SET_ALIAS_SHOW:
+	case UI_SET_PTT_LOCKED:
+	case UI_SET_HEAR_ALL_DEFAULT:
+#if CONFIG_DUAL_WATCH
+	case UI_SET_DUAL_TALK_BACK:
+#endif
+		st = settings_begin();
+		st->ui_flags = (uint8_t)(value != 0 ? st->ui_flags | ui_flag(id) : st->ui_flags & ~ui_flag(id));
+		settings_end(hal_millis());
+		return true;
+	case UI_SET_VIBRATE:
+		st = settings_begin();
+		st->ui_flags = (uint8_t)(value != 0 ? st->ui_flags & ~SETTINGS_UI_NO_VIBRATE :
+					 st->ui_flags | SETTINGS_UI_NO_VIBRATE);
+		settings_end(hal_millis());
+		return true;
+	case UI_SET_THEME:
+	case UI_SET_ACCENT:
+	case UI_SET_STRIP:
+	case UI_SET_UPDOWN_HOME:
+	case UI_SET_LOW_BATTERY:
+	case UI_SET_AUTO_OFF_MIN:
+		st = settings_begin();
+		if (id == UI_SET_THEME) {
+			st->theme = (uint8_t)((st->theme & ~SETTINGS_SMALL_MASK) | clamp16(value, 0, 2));
+		} else if (id == UI_SET_ACCENT) {
+			st->accent = (uint8_t)((st->accent & ~SETTINGS_ACCENT_COLOR) |
+					       clamp16(value, 0, SETTINGS_ACCENT_COLOR));
+		} else if (id == UI_SET_STRIP) {
+			st->accent = (uint8_t)(value ? st->accent & ~SETTINGS_ACCENT_PLAIN : st->accent | SETTINGS_ACCENT_PLAIN);
+		} else if (id == UI_SET_UPDOWN_HOME) {
+			st->updown_home = (uint8_t)((st->updown_home & ~SETTINGS_SMALL_MASK) | clamp16(value, 0, 2));
+		} else if (id == UI_SET_LOW_BATTERY) {
+			st->low_batt_pct = (uint8_t)clamp16(value, 0, 50);
+		} else {
+			st->auto_off_min = clamp16(value, 0, 24u * 60u);
+		}
+		settings_end(hal_millis());
+		return true;
+#if CONFIG_DMR_PRIVACY
+	case UI_SET_PRIVACY_TYPE:
+		privacy_store((uint8_t)clamp16(value, 0, DMR_PRIVACY_NUM_TYPES - 1),
+			      (uint32_t)ui_svc_setting_get(UI_SET_PRIVACY_KEY));
+		return true;
+	case UI_SET_PRIVACY_KEY:
+		privacy_store((uint8_t)ui_svc_setting_get(UI_SET_PRIVACY_TYPE), (uint32_t)clamp16(value, 0, 0xFFFF));
+		return true;
+#endif
+#if CONFIG_CRASH_REPORT
+	case UI_SET_CRASH_MODE:
+	case UI_SET_CRASH_CONTACT:
+		st = settings_begin();
+		if (id == UI_SET_CRASH_MODE)
+			settings_set_crash_mode(st, (uint8_t)clamp16(value, UI_CRASH_SEND_OFF, UI_CRASH_SEND_AUTO));
+		else
+			settings_set_crash_contact(st, clamp16(value, 0, CODEPLUG_CONTACTS_MAX));
+		settings_end(hal_millis());
+		return true;
+#endif
+	case UI_SET_REF_TRIM:
+		st = settings_begin();
+		st->ref_trim_ppb = ref_trim_clamp(value);
+		settings_end(hal_millis());
+		return true;
+	case UI_SET_MIC_GAIN:
+	case UI_SET_AUTO_LOCK_S:
+	case UI_SET_LONG_PRESS_MS:
+	case UI_SET_REPEAT_MS:
+	case UI_SET_GPS:
+	case UI_SET_POS_FORMAT:
+	case UI_SET_POS_SEND_S:
+		st = settings_begin();
+		if (id == UI_SET_MIC_GAIN) {
+			st->mic_gain = (uint8_t)clamp16(value, 0, 10);
+		} else if (id == UI_SET_AUTO_LOCK_S) {
+			st->auto_lock_s = clamp16(value, 0, 3600);
+		} else if (id == UI_SET_LONG_PRESS_MS) {
+			st->long_press_ms = clamp16(value, 200, 3000);
+		} else if (id == UI_SET_REPEAT_MS) {
+			st->repeat_ms = clamp16(value, 40, 1000);
+		} else if (id == UI_SET_GPS) {
+			st->gps = value != 0;
+		} else if (id == UI_SET_POS_FORMAT) {
+			st->pos_format = (uint8_t)clamp16(value, 0, 2);
+		} else {
+			st->pos_send_s = clamp16(value, 0, 0xFFFF);
+		}
+		settings_end(hal_millis());
+		return true;
+	case UI_SET_LANGUAGE:
+		if (value < 0 || value > 0xFFFF)
+			return false;
+		st = settings_begin();
+		st->lang[0] = (char)(value >> 8);
+		st->lang[1] = (char)value;
+		settings_end(hal_millis());
+		return true;
+	case UI_SET_VOLUME:
+		st = settings_begin();
+		st->volume = radio_volume_stored((uint8_t)clamp16(value, 0, RADIO_VOLUME_MAX));
+		settings_end(hal_millis());
+		radio_req_volume((uint8_t)clamp16(value, 0, RADIO_VOLUME_MAX));	// in force now, not at the next reload
+		return true;
+	case UI_SET_BRIGHTNESS:
+		st = settings_begin();
+		st->brightness = (uint8_t)(value < 10 ? 10 : value > 100 ? 100 : value);
+		settings_end(hal_millis());
+		return true;
+	case UI_SET_SQUELCH:
+		st = settings_begin();
+		st->squelch = (uint8_t)(value < 0 ? 0 : value > 9 ? 9 : value);
+		settings_end(hal_millis());
+		radio_req_reload();	// the default squelch is a preference the radio core reads on reload
+		return true;
+	case UI_SET_HOTSPOT_AUTO:
+		st = settings_begin();
+		st->hotspot_allowed = value != 0;
+		settings_end(hal_millis());
+#if CONFIG_HOSTLINK
+		hostlink_set_hotspot_allowed(value != 0);
+#endif
+		return true;
+	case UI_SET_TFTP_WRITE:
+		st = settings_begin();
+		st->net_flags = (uint8_t)(value != 0 ? (st->net_flags & ~SETTINGS_NET_TFTP_NO_WRITE) :
+					  (st->net_flags | SETTINGS_NET_TFTP_NO_WRITE));
+		settings_end(hal_millis());
+#if CONFIG_TFTP
+		tftp_codeplug_allow_write(value != 0);
+#endif
+		return true;
+#if CONFIG_ZONE_SHARE
+	case UI_SET_ZONE_OFFERS:
+		if (value != 0 && value != 1)
+			return false;
+		st = settings_begin();
+		st->zs_offers = value ? 1u : SETTINGS_ZS_OFF;
+		settings_end(hal_millis());
+		zone_share_set_offers(value ? ZS_OFFERS_ASK : ZS_OFFERS_OFF);
+		return true;
+#endif
+#if CONFIG_DMR
+	case UI_SET_DMR_ID:
+		return dmr_id_post((uint32_t)value);
+#endif
+	case UI_SET_NOISE_REDUCTION:	// ui_svc_apply hands them to the vocoder
+	case UI_SET_MIC_AGC: {
+		// The stored bit is set for "on" with AGC, for "off" with noise reduction (0 = the defaults)
+		uint8_t bit = id == UI_SET_MIC_AGC ? SETTINGS_AUDIO_AGC : SETTINGS_AUDIO_NO_NOISE_REDUCTION;
+		bool set = (value != 0) == (id == UI_SET_MIC_AGC);
+		st = settings_begin();
+		st->accent = (uint8_t)(set ? (st->accent | bit) : (st->accent & ~bit));
+		settings_end(hal_millis());
+		return true;
+	}
+#if CONFIG_DMR_DATA_CORE
+	case UI_SET_CHECK_REPLY:
+	case UI_SET_ALERT_ANSWER:
+	case UI_SET_POS_REPLY: {
+		dmrDataSettings_t ds;
+		dmr_data_get_settings(&ds);
+		if (id == UI_SET_CHECK_REPLY)
+			ds.radioCheckReply = value != 0;
+		else if (id == UI_SET_ALERT_ANSWER)
+			ds.callAlertAck = value != 0;
+		else
+			ds.lrrpReply = value != 0;
+		dmr_data_set_settings(&ds);	// the radio core saves the data service's settings when they change
+		return true;
+	}
+	case UI_SET_MSG_FORMAT: {
+		dmrDataSettings_t ds;
+		if ((value != DMR_SMS_FORMAT_ETSI_IP) && (value != DMR_SMS_FORMAT_ETSI) &&
+		    !(CONFIG_DMR_TMS && (value == DMR_SMS_FORMAT_TMS)))
+			return false;
+		dmr_data_get_settings(&ds);
+		ds.smsFormat = (uint8_t)value;
+		dmr_data_set_settings(&ds);
+		return true;
+	}
+#endif
+#if CONFIG_USB_NETWORK && CONFIG_HOSTLINK
+	case UI_SET_USB_BOOT_NET:
+	case UI_SET_PC_ENDPOINT:
+	case UI_SET_USB_FIXED_LINK:
+		st = settings_begin();
+		if (id == UI_SET_USB_BOOT_NET)
+			st->usb_mode = value != 0;
+		else if (CONFIG_DMR_CONTROL_STATION) {
+			uint8_t bit = id == UI_SET_PC_ENDPOINT ? SETTINGS_NET_PASSTHROUGH : SETTINGS_NET_FIXED_LINK;
+			st->net_flags = (uint8_t)(value ? (st->net_flags | bit) : (st->net_flags & ~bit));
+		}
+		settings_end(hal_millis());
+		hostlink_settings_changed();
+		return true;
+#endif
+	case UI_SET_VFO_STEP:
+		return true;	// ui_svc_apply hands it to the radio core, which saves it
+#if CONFIG_DUAL_WATCH
+	case UI_SET_DUAL_B:
+		st = settings_begin();
+		st->dual_b = (uint16_t)clamp16(value & UI_DUAL_CODE, 0, UI_DUAL_B_VFO2);
+		st->dual_state = (uint8_t)(((value & UI_DUAL_ON) ? SETTINGS_DUAL_ON : 0) |
+					   ((value & UI_DUAL_B_SEL) ? SETTINGS_DUAL_B_SEL : 0));
+		settings_end(hal_millis());
+		return true;
+#endif
+	default:
+		return ui_svc_ram_set(id, value);
+	}
+}
+
+// --- Codeplug writes, on the housekeeping task (storage_job_post) ---
+
+// text: English, marked TRN. The UI translates it when it shows it (tr), so a translation longer than the event's 40
+// bytes isn't cut, and this task needs no language. The English must fit: a cut text never matches its translation
+static void save_failed_text(const char *text)
+{
+	ui_event_t ev;
+	memset(&ev, 0, sizeof ev);
+	ev.kind = UI_EV_SAVE_FAILED;
+	strncpy(ev.text, text, sizeof ev.text - 1);
+	ui_notify(&ev);
+}
+
+#define save_failed(s)	do { \
+	_Static_assert(sizeof(s) <= sizeof((ui_event_t){0}.text), "the text fits ui_event_t.text"); \
+	save_failed_text(s); \
+} while (0)
+
+// What the job writes: a copy of the radio's view taken when the UI asked (the job runs up to 100 ms later), and the
+// talk target for a permanent one. Only the UI task fills it, and only while no job is pending
+static struct {
+	uint16_t channel;
+	uint8_t temp;
+	uint8_t power;
+	uint8_t squelch;
+	uint8_t held;		// a write held for the foreign codeplug question: cp_jobs[held - 1], 0 none (in padding)
+	union {
+		channel_t now;		// the channel as the radio has it now (temporary changes included)
+#if CONFIG_CONTACT_EDIT
+		contact_t contact;	// the contact editor's, at index channel (one job at a time: RAM is short)
+#endif
+		char name[CODEPLUG_NAME_LEN + 1];	// a name field's new text, UI_NAME_* in channel
+#if CONFIG_DMR
+		contact_t target;	// save_target_job's search: the stored contact found
+#endif
+	};
+	uint32_t id;		// the talk target's, or the radio's own DMR ID
+	bool private_call;
+} job;
+
+// Another firmware's codeplug (codeplug_foreign, docs/spec/codeplug-native.md 2): the radio erases nothing of it on
+// its own. The first codeplug write is held (job.held) and the UI asks (UI_EV_CODEPLUG_FOREIGN,
+// ui_svc_codeplug_answer). While one is held no other write starts (job_busy), so the job struct keeps what the held
+// write needs. An index into this table, not a pointer: no RAM of its own (some radios have none to spare)
+static void save_channel_job(void *ctx);
+static void write_channel_job(void *ctx);
+static void name_job(void *ctx);
+#if CONFIG_DMR
+static void dmr_id_job(void *ctx);
+static void save_target_job(void *ctx);
+#endif
+#if CONFIG_CONTACT_EDIT
+static void write_contact_job(void *ctx);
+#endif
+#if CONFIG_ZONE_EDIT
+static void zone_edit_job(void *ctx);
+#endif
+#if CONFIG_KEY_ASSIGN
+static void key_write_job(void *ctx);
+#endif
+static void (*const cp_jobs[])(void *ctx) = {
+	save_channel_job, write_channel_job, name_job,
+#if CONFIG_DMR
+	dmr_id_job, save_target_job,
+#endif
+#if CONFIG_CONTACT_EDIT
+	write_contact_job,
+#endif
+#if CONFIG_ZONE_EDIT
+	zone_edit_job,
+#endif
+#if CONFIG_KEY_ASSIGN
+	key_write_job,
+#endif
+};
+
+static bool job_busy(void)
+{
+	return storage_job_busy() || job.held != 0;
+}
+
+// A codeplug write as a storage job, or held for the question
+static bool cp_post(void (*fn)(void *ctx))
+{
+	if (job.held != 0) {
+		return false;
+	}
+	if (!codeplug_foreign()) {
+		return storage_job_post(fn, NULL);
+	}
+	const uint8_t n = (uint8_t)(sizeof(cp_jobs) / sizeof(cp_jobs[0]));
+	uint8_t i = 0;
+	while (i < n && cp_jobs[i] != fn) {
+		i++;
+	}
+	if (i == n) {
+		return false;
+	}
+	ui_event_t ev;
+	memset(&ev, 0, sizeof ev);
+	ev.kind = UI_EV_CODEPLUG_FOREIGN;
+	job.held = (uint8_t)(i + 1u);
+	if (!ui_notify(&ev)) {
+		job.held = 0;
+		return false;
+	}
+	return true;
+}
+
+#if CONFIG_ZONE_EDIT
+static void zone_drop(void);
+#endif
+#if CONFIG_KEY_ASSIGN
+static void key_reload(void);
+#endif
+
+// What a held write changed on the UI task alone goes back to the codeplug's: the side keys, the zone edits queued
+static void cp_drop(void)
+{
+	job.held = 0;
+#if CONFIG_KEY_ASSIGN
+	key_reload();
+#endif
+#if CONFIG_ZONE_EDIT
+	zone_drop();
+#endif
+}
+
+static void cp_answer_job(void *ctx)
+{
+	void (*fn)(void *ctx) = cp_jobs[job.held - 1u];
+	if ((uintptr_t)ctx == UI_CP_USE) {
+		codeplug_accept(true);		// app.c stores it
+		codeplug_reload();		// the old codeplug's records shown; the write made on the built-in set dropped
+		cp_drop();
+	} else if (codeplug_start_new()) {
+		job.held = 0;
+		fn(NULL);
+	} else {
+		cp_drop();
+		save_failed(TRN("Couldn't write the codeplug: not saved"));
+	}
+}
+
+bool ui_svc_codeplug_answer(uint8_t answer)
+{
+	if (job.held == 0 || storage_job_busy()) {
+		return false;
+	}
+	if (answer != UI_CP_NEW && answer != UI_CP_USE) {
+		cp_drop();
+		return true;
+	}
+	return storage_job_post(cp_answer_job, (void *)(uintptr_t)answer);	// the answer in ctx: no RAM of its own
+}
+
+#if CONFIG_DMR
+// The radio's own DMR ID, written into the codeplug (Settings > My radio): the radio core takes it when
+// codeplug_serial() changes, and a CPS read shows it
+static void dmr_id_job(void *ctx)
+{
+	(void)ctx;
+	if (!codeplug_set_dmr_id(job.id))
+		save_failed(TRN("Couldn't write the codeplug: not saved"));
+}
+
+static bool dmr_id_post(uint32_t id)
+{
+	if (id == 0 || id > CODEPLUG_DMR_ID_MAX || job_busy())
+		return false;
+	job.id = id;
+	return cp_post(dmr_id_job);
+}
+#endif
+
+static channel_t job_ch;	// the job's working copy of the stored channel
+
+// Power, bandwidth, tones, mode, color code and timeslot go into the channel; the squelch is radio-wide (the default
+// squelch preference). The radio core re-reads the channel (codeplug_serial), and the clear makes the remaining
+// flags follow the new values
+static void save_channel_job(void *ctx)
+{
+	(void)ctx;
+	if (!codeplug_channel(job.channel, &job_ch)) {
+		save_failed(TRN("Couldn't read the channel: not saved"));
+		return;
+	}
+	if (job.temp & RADIO_TEMP_POWER)
+		job_ch.power = job.power;
+	if (job.temp & RADIO_TEMP_BW)
+		job_ch.bw = job.now.bw;
+	if (job.temp & RADIO_TEMP_TX_TONE)
+		job_ch.tx_tone = job.now.tx_tone;
+	if (job.temp & RADIO_TEMP_RX_TONE)
+		job_ch.rx_tone = job.now.rx_tone;
+	if (job.temp & RADIO_TEMP_MODE)
+		job_ch.mode = job.now.mode;
+	if (job.temp & RADIO_TEMP_CC)
+		job_ch.color_code = job.now.color_code;
+	if (job.temp & RADIO_TEMP_TS)
+		job_ch.timeslot = job.now.timeslot;
+	if (!codeplug_set_channel(job.channel, &job_ch)) {
+		save_failed(TRN("Couldn't write the codeplug: not saved"));
+		return;
+	}
+	if (job.temp & RADIO_TEMP_SQUELCH) {
+		settings_t *st = settings_begin();
+		st->squelch = job.squelch;
+		settings_end(hal_millis());
+	}
+	radio_req_clear_temporary();
+}
+
+// Whether the radio is on a stored channel (its view in v)
+static bool take_channel(void)
+{
+	if (job_busy()) {
+		return false;	// the last write is still going on
+	}
+	radio_get_view(&v);
+	if (v.vfo || v.channel_number == 0 || v.hotspot) {
+		return false;
+	}
+	job.channel = v.channel_number;
+	job.temp = v.temp;
+	job.power = v.power;
+	job.squelch = v.squelch;
+	job.now = v.ch;
+	return true;
+}
+
+bool ui_svc_save_channel(void)
+{
+	return take_channel() && cp_post(save_channel_job);
+}
+
+// The channel editor's whole channel (ui.md 2.1). Writing the channel in use drops its temporary changes: the radio
+// core re-reads it (codeplug_serial), and the edited values are what the user wants now. Whether it is the channel in
+// use is decided here on the UI task: the job runs on the housekeeping task, which must not touch v
+static void write_channel_job(void *ctx)
+{
+	(void)ctx;
+	if (!codeplug_set_channel(job.channel, &job.now)) {
+		save_failed(TRN("Couldn't write the codeplug: not saved"));
+		return;
+	}
+	if (job.temp != 0) {
+		radio_req_clear_temporary();
+	}
+}
+
+bool ui_svc_write_channel(uint16_t number, const channel_t *ch)
+{
+	if (number == 0 || number > CODEPLUG_CHANNELS_MAX || job_busy()) {
+		return false;
+	}
+	radio_get_view(&v);
+	job.channel = number;
+	job.temp = !v.vfo && v.channel_number == number && v.temporary;	// here: drop the temporary changes after it
+	job.now = *ch;
+	return cp_post(write_channel_job);
+}
+
+#if CONFIG_CONTACT_EDIT
+// The contact editor's contact (ui.md 2.4). The radio core's name cache follows codeplug_serial()
+
+static void write_contact_job(void *ctx)
+{
+	(void)ctx;
+	if (!codeplug_set_contact(job.channel, &job.contact)) {
+		save_failed(TRN("Couldn't write the codeplug: not saved"));
+	}
+}
+
+bool ui_svc_write_contact(uint16_t index, const contact_t *c)
+{
+	if (index == 0 || index > CODEPLUG_CONTACTS_MAX || job_busy()) {
+		return false;
+	}
+	job.channel = index;
+	job.contact = *c;
+	return cp_post(write_contact_job);
+}
+#endif
+
+#if CONFIG_ZONE_EDIT
+// The zone editor's changes (ui.md 2.2), queued: Move up pressed again while the last move is still being written
+// waits its turn instead of being refused. The UI task adds at zq_head, the job takes from zq_tail. A new zone ahead
+// of others or a deleted zone moves zone indexes: the radio core and dual watch follow them through zone_edit's log
+// when they see the codeplug change, so the job only writes
+#define ZONE_QUEUE	4u
+static zone_op_t zq[ZONE_QUEUE];
+static volatile uint8_t zq_head, zq_tail;
+
+static const char *zone_edit_text(zone_edit_result_t r)
+{
+	switch (r) {
+	case ZONE_EDIT_FULL: return TRN("Zone full: not saved");
+	case ZONE_EDIT_ZONES_FULL: return TRN("No room for another zone");
+	case ZONE_EDIT_IN_ZONE: return TRN("Already in this zone");
+	case ZONE_EDIT_NO_FREE: return TRN("No free channel");
+	case ZONE_EDIT_NO_NAME: return TRN("Give it a name first");
+	case ZONE_EDIT_EDGE: return TRN("Already at the end");
+	case ZONE_EDIT_NO_ZONE: return TRN("That zone is gone");
+	case ZONE_EDIT_NO_CHANNEL: return TRN("That channel is gone");
+	default: return TRN("Couldn't write the codeplug: not saved");
+	}
+}
+
+// A refusal drops the changes queued after it: they were made on the zone as the UI saw it with this one done
+static void zone_edit_job(void *ctx)
+{
+	(void)ctx;
+	while (zq_tail != zq_head) {
+		zone_edit_result_t r = zone_edit_apply(&zq[zq_tail % ZONE_QUEUE], NULL);
+		if (r != ZONE_EDIT_OK) {
+			save_failed(zone_edit_text(r));
+			zq_tail = zq_head;
+			break;
+		}
+		zq_tail = (uint8_t)(zq_tail + 1u);
+	}
+}
+
+// The job, unless one (this or another write) is running: then ui_svc_zone_poll posts it later
+static void zone_kick(void)
+{
+	if (zq_tail != zq_head && !job_busy()) {
+		cp_post(zone_edit_job);
+	}
+}
+
+// The edits queued, dropped with the held write (cp_drop)
+static void zone_drop(void)
+{
+	zq_tail = zq_head;
+}
+
+bool ui_svc_zone_edit(const zone_op_t *op)
+{
+	if ((uint8_t)(zq_head - zq_tail) >= ZONE_QUEUE) {
+		return false;
+	}
+	zq[zq_head % ZONE_QUEUE] = *op;
+	zq_head = (uint8_t)(zq_head + 1u);
+	zone_kick();
+	return true;
+}
+
+void ui_svc_zone_poll(void)
+{
+	zone_kick();
+}
+
+bool ui_svc_zone_pending(void)
+{
+	return zq_tail != zq_head;
+}
+#endif
+
+#if CONFIG_DMR
+// The first stored contact with this ID and kind becomes the channel's talk target. Searching the contacts reads up
+// to 1024 records, so it is part of the job too. Until it is done the target is a temporary one (ui_svc_talk_to)
+static void save_target_job(void *ctx)
+{
+	(void)ctx;
+	if (!codeplug_channel(job.channel, &job_ch)) {
+		save_failed(TRN("Couldn't read the channel: for now only"));
+		return;
+	}
+	// A contact record that couldn't be read counts as not stored: nothing is written then
+	uint16_t found = codeplug_contact_find_index(job.id, !job.private_call, &job.target);
+	if (found == 0) {
+		save_failed(TRN("Not a stored contact: for now only"));
+		return;
+	}
+	job_ch.contact = found;
+	if (!codeplug_set_channel(job.channel, &job_ch)) {
+		save_failed(TRN("Codeplug not written: for now only"));
+		return;
+	}
+	radio_req_dmr_target_clear();	// the channel's own target is this one now
+}
+
+bool ui_svc_save_talk_target(uint32_t id, bool private_call)
+{
+	if (id == 0)
+		return false;
+	radio_get_view(&v);
+	if (v.vfo) {
+		if (!CONFIG_VFO_DMR || v.hotspot)
+			return false;
+		radio_req_dmr_target(id, private_call);	// the VFO's own target: kept with its settings, nothing to write
+		return true;
+	}
+	if (!take_channel())
+		return false;
+	job.id = id;
+	job.private_call = private_call;
+	if (!cp_post(save_target_job))
+		return false;
+	radio_req_dmr_target(id, private_call);	// in effect at once; the job makes it the channel's
+	return true;
+}
+#endif
+
+// Factory reset: the settings back to the defaults (saved at once), the native area emptied when it holds our data
+// or nothing (storage_native_erase leaves another firmware's data alone), then a restart so every task starts from
+// the defaults. Never the open-firmware codeplug, the calibration, or the settings ring and journal as raw flash (the
+// defaults go in as a new record, through the foreign region guard)
+static void factory_reset_job(void *ctx)
+{
+	(void)ctx;
+	settings_t *st = settings_begin();
+	settings_defaults(st);	// cp_flags too: "Use anyway" doesn't outlive a reset
+	settings_end(hal_millis());
+	codeplug_accept(false);
+	bool saved = settings_flush();
+	storage_native_t n = storage_native_erase();
+	if (!saved && storage_ready()) {
+		save_failed(TRN("Reset: the settings couldn't be saved"));
+		return;
+	}
+	if (n == STORAGE_NATIVE_FAILED && storage_ready()) {
+		save_failed(TRN("Reset: native area couldn't be erased"));
+		return;
+	}
+	if (board.system != NULL && board.system->reboot != NULL) {
+		board.system->reboot(HAL_REBOOT_NORMAL);	// does not return when it works
+	}
+	radio_req_reload();	// no restart: the radio core takes the defaults now
+}
+
+bool ui_svc_factory_reset(void)
+{
+	return storage_job_post(factory_reset_job, NULL);
+}
+
+void ui_svc_boot_text(char line1[17], char line2[17])
+{
+	codeplug_boot_text(line1, line2);
+}
+
+void ui_svc_name_get(uint8_t which, char out[17])
+{
+	char other[CODEPLUG_NAME_LEN + 1];
+	if (which == UI_NAME_RADIO)
+		codeplug_radio_name(out);
+	else if (which == UI_NAME_BOOT1)
+		codeplug_boot_text(out, other);
+	else if (which == UI_NAME_BOOT2)
+		codeplug_boot_text(other, out);
+	else
+		out[0] = '\0';
+}
+
+// The boot lines are one record: the line not changed is read again here, so a CPS write since stays
+static void name_job(void *ctx)
+{
+	(void)ctx;
+	char l1[CODEPLUG_NAME_LEN + 1], l2[CODEPLUG_NAME_LEN + 1];
+	bool ok;
+	if (job.channel == UI_NAME_RADIO) {
+		ok = codeplug_set_radio_name(job.name);
+	} else {
+		codeplug_boot_text(l1, l2);
+		ok = codeplug_set_boot_text(job.channel == UI_NAME_BOOT1 ? job.name : l1,
+					    job.channel == UI_NAME_BOOT2 ? job.name : l2);
+	}
+	if (!ok)
+		save_failed("Couldn't write the codeplug: not saved");
+}
+
+bool ui_svc_name_set(uint8_t which, const char *text)
+{
+	if (which >= UI_NAME_COUNT || job_busy())
+		return false;
+	job.channel = which;
+	strncpy(job.name, text, CODEPLUG_NAME_LEN);
+	job.name[CODEPLUG_NAME_LEN] = '\0';
+	return cp_post(name_job);
+}
+
+#if CONFIG_KEY_ASSIGN
+// --- Side keys (core/input/keyassign.h): the codeplug's quick-key slots, a copy here (UI task only), the key map
+// built from them handed to the input task. A codeplug a CPS wrote is read again; a change made in Settings is
+// written by a storage job, and until it lands the copy here is the one that counts ---
+
+_Static_assert(UI_KEY_ROLES == KEYASSIGN_ROLES, "a setting pair per role");
+static uint16_t key_slots[KEYASSIGN_SLOTS];
+static uint16_t key_job_slots[KEYASSIGN_SLOTS];	// what the job writes (filled only while no job is pending)
+static uint32_t key_serial;
+static bool key_loaded, key_dirty;
+
+static void key_apply(void)
+{
+	keymap_entry_t map[INPUT_KEYS_MAX];
+	uint8_t n = board.keymap_len > INPUT_KEYS_MAX ? INPUT_KEYS_MAX : board.keymap_len;
+	keyassign_build(board.keymap, n, board.side_keys, board.side_key_count, key_slots, map);
+	input_set_keymap(map);
+}
+
+static void key_load(void)
+{
+	key_serial = codeplug_serial();
+	(void)codeplug_quick_keys(key_slots);	// none stored: all 0, no marker, the board's key map
+	key_loaded = true;
+	key_apply();
+}
+
+// The slots read again at the next poll (the UI task's): a held write of them was dropped
+static void key_reload(void)
+{
+	key_loaded = false;
+}
+
+static void key_write_job(void *ctx)
+{
+	(void)ctx;
+	if (!codeplug_set_quick_keys(key_job_slots)) {
+		save_failed(TRN("Couldn't save the keys: for now only"));
+	}
+}
+
+void ui_svc_keys_poll(void)
+{
+	if (!key_loaded) {
+		key_load();
+	}
+	if (key_dirty) {
+		if (job_busy()) {
+			return;
+		}
+		memcpy(key_job_slots, key_slots, sizeof(key_job_slots));
+		if (cp_post(key_write_job)) {
+			key_dirty = false;
+		}
+		return;
+	}
+	if (!job_busy() && codeplug_serial() != key_serial) {
+		key_load();	// a CPS or TFTP write, or our own job, landed
+	}
+}
+
+static int32_t key_get(uint8_t id)
+{
+	if (!key_loaded) {
+		key_load();
+	}
+	uint8_t k = (uint8_t)(id - UI_SET_KEY_FIRST);
+	return keyassign_get(key_slots, k / 2u, (k & 1u) != 0);
+}
+
+static bool key_set(uint8_t id, int32_t value)
+{
+	uint8_t k = (uint8_t)(id - UI_SET_KEY_FIRST);
+	if (k / 2u >= board.side_key_count || value < 0 || value >= KEYFN_COUNT) {
+		return false;
+	}
+	if (!key_loaded) {
+		key_load();
+	}
+	keyassign_set(key_slots, k / 2u, (k & 1u) != 0, (uint8_t)value);
+	key_apply();
+	key_dirty = true;
+	return true;
+}
+#endif

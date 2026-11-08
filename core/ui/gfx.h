@@ -1,0 +1,126 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 The RadioFoundry Authors
+// Drawing into the UI's frame buffer and sending changed rows to the display (hal_display_t).
+// Works on any panel whose frame buffer fits GFX_FB_BYTES: RGB565 (bpp 16), 16 colors (bpp 4) or 1 bit per pixel (bpp 1,
+// MSB left). At bpp 4 the drawing calls still take RGB565: gfx keeps a 16-entry palette of the colors in use (a screen
+// uses about a dozen); past 16, a color gets the nearest one already there.
+#ifndef UI_GFX_H
+#define UI_GFX_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include "config.h"
+#include "hal_display.h"
+#include "font.h"
+
+// Frame buffer size, static in main SRAM (DMA capable). 160 x 128 x 16 bpp = 40 KB. A 240 x 320 color panel
+// (150 KB) does not fit the STM32F405's 128 KB SRAM; at bpp 4 it takes 37.5 KB.
+// The host simulator sets larger values to render 240 x 320.
+#ifndef GFX_FB_BYTES
+#define GFX_FB_BYTES	(160u * 128u * 2u)
+#endif
+#ifndef GFX_MAX_ROWS
+#define GFX_MAX_ROWS	160u
+#endif
+// The 16-color frame buffer (bpp 4): only boards with such a panel build it (the palette and its code)
+#ifndef GFX_INDEXED
+#define GFX_INDEXED	0
+#endif
+
+// RGB565. On a 1 bpp panel any nonzero color is ink (pixel set), zero is paper
+typedef uint16_t color_t;
+#define RGB565(r, g, b)	((color_t)((((r) & 0xF8u) << 8) | (((g) & 0xFCu) << 3) | ((b) >> 3)))
+
+// Take over the display. False if its frame buffer doesn't fit (then nothing is drawn)
+bool gfx_init(const hal_display_t *disp);
+int gfx_width(void);
+int gfx_height(void);
+int gfx_bpp(void);
+const void *gfx_framebuffer(void);
+
+// Drawing is clipped to this rectangle (and always to the screen)
+void gfx_clip(int x, int y, int w, int h);
+void gfx_clip_off(void);
+
+void gfx_pixel(int x, int y, color_t c);
+color_t gfx_get_pixel(int x, int y);	// RGB565, or 0 / 1 on a 1 bpp panel
+// n bytes of the frame as RGB565 (little endian, rows of width * 2 bytes) from byte off: screen captures of a bpp 4
+// panel. At bpp 16 the frame buffer itself
+void gfx_read_rgb565(uint32_t off, uint8_t *out, size_t n);
+// The color index i stands for, for a screen capture at the panel's own depth (the frame buffer's rows and this):
+// bpp 4 the palette (0 for an entry not set), bpp 1 the paper (0) and ink (1) of the UI gallery's screenshots, bpp 16
+// 0
+color_t gfx_palette(uint8_t i);
+#define GFX_PAPER	RGB565(0xC8, 0xD0, 0xB8)
+#define GFX_INK		RGB565(0x14, 0x18, 0x10)
+
+// Readers of the frame buffer in a higher priority task (screen captures, the web control page): the UI task marks
+// each frame's start, gfx_flush its end. gfx_frame_idle gives the frame count and whether no frame is being drawn; the
+// same count, idle, before and after a read says the read was whole
+void gfx_frame_begin(void);
+bool gfx_frame_idle(uint32_t *frames);
+#if CONFIG_NET_WEBCTL
+// A copy of the screen kept elsewhere (the web control page, core/net/webctl.c), sent the rows that change: gfx_flush
+// marks the rows it sent the panel
+int gfx_row_next(int from);		// the first row from `from` on that changed since it was taken, -1 none
+void gfx_rows_take(int from, int to);	// rows from..to (inclusive) sent: unmarked
+void gfx_rows_mark_all(void);		// a new reader: every row
+#endif
+void gfx_fill(int x, int y, int w, int h, color_t c);
+void gfx_clear(color_t c);
+void gfx_hline(int x, int y, int w, color_t c);
+void gfx_vline(int x, int y, int h, color_t c);
+void gfx_rect(int x, int y, int w, int h, color_t c);	// outline
+void gfx_round_fill(int x, int y, int w, int h, color_t c);	// corners cut by one pixel
+
+// Text with its top-left corner at x, y. Returns the x after the last glyph
+int gfx_text(const font_t *f, int x, int y, const char *s, color_t fg);
+// The same with each glyph cell filled with bg first
+int gfx_text_bg(const font_t *f, int x, int y, const char *s, color_t fg, color_t bg);
+int gfx_text_width(const font_t *f, const char *s);
+// Text alternates (font.h): s with every group at its alternative number level (or its last one) into out; *more says
+// whether a higher level would give something different. Returns the length
+size_t gfx_text_alt(const char *s, int level, char *out, size_t cap, bool *more);
+// Copy s into out, shortened from the middle with an ellipsis so it is at most max_w pixels wide
+void gfx_text_fit(const font_t *f, const char *s, int max_w, char *out, size_t out_len);
+#ifdef GFX_FIT_TRACE
+// Host builds only: called whenever gfx_text_fit had to shorten a text (the simulator lists them per screen)
+void gfx_fit_trace(const char *src, const char *out);
+// Host builds only: every text, fill and clear with its rectangle in safe-area coordinates (text: the whole string,
+// before clipping) and the clip rectangle in force (x0, y0 inclusive, x1, y1 exclusive), for the layout check
+typedef enum { GFX_TRACE_TEXT, GFX_TRACE_FILL, GFX_TRACE_CLEAR } gfx_trace_kind_t;
+void gfx_draw_trace(gfx_trace_kind_t kind, int x, int y, int w, int h, const int clip[4], const char *s);
+#endif
+
+// Icons drawn from primitives
+// Battery outline w x h with a fill proportional to pct (0..100)
+void gfx_icon_battery(int x, int y, int w, int h, uint8_t pct, color_t outline, color_t fill);
+// Signal bars: count bars of rising height in a w x h box, lit = how many are on
+void gfx_icon_bars(int x, int y, int w, int h, uint8_t count, uint8_t lit, color_t on, color_t off);
+// A filled pill with text, padded; returns its width
+int gfx_pill(const font_t *f, int x, int y, int h, const char *s, color_t fg, color_t bg);
+
+// Send the rows that changed since the last flush (compared by a hash per row) to the display
+void gfx_flush(void);
+// Freeze the frame buffer for a screen capture: the UI skips redraws until ms (hal_millis) or gfx_hold(0)
+void gfx_hold(uint32_t until_ms);
+bool gfx_held(uint32_t now_ms);
+// The UI task's wait for input before its next pass: idle_ms with nothing to draw, else until the next frame (frame_ms
+// after the last draw). While a capture holds redraws it is a whole frame: a wait of 0 would spin the UI task for the
+// whole capture and starve the idle task, which feeds the watchdog (a 40-chunk color screenshot outlasts its timeout)
+static inline uint32_t gfx_pass_wait_ms(bool dirty, bool held, uint32_t since_draw_ms, uint32_t frame_ms,
+	uint32_t idle_ms)
+{
+	if (!dirty) {
+		return idle_ms;
+	}
+	if (held) {
+		return frame_ms;
+	}
+	return since_draw_ms >= frame_ms ? 0 : frame_ms - since_draw_ms;
+}
+// Make the next flush send every row
+void gfx_invalidate(void);
+
+#endif

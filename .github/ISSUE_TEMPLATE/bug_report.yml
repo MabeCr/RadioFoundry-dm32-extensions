@@ -1,0 +1,129 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 The RadioFoundry Authors
+name: Bug report
+description: Something on the radio, in a tool or on the web site doesn't work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One problem per issue. Never attach the AMBE codec, a stock firmware file, a bootloader key, a flash or memory
+        dump or audio recordings: they can't be in this repository, and issues are public.
+  - type: dropdown
+    id: radio
+    attributes:
+      label: Radio
+      options:
+        # generated: tools/boards.py docs radios; edit boards/*/board.toml
+        - Baofeng DM-32UV
+        - Baofeng DM-1701 / Retevis RT84
+        - Baofeng DM-1801 Pro / DM-1801
+        - Radioddity DB25-D PRO / Kydera CDR-300UV
+        - TYT MD-380 / MD-390 / Retevis RT3
+        - TYT MD-UV380 / MD-UV390 / Retevis RT3S / MD-UV390 Plus 10 W
+        # end generated
+        - Not radio-specific (tools, web site, docs)
+        - Other (say which below)
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Firmware version
+      description: Settings > Advanced > About shows the version and commit. Or `tools/rfoundry_debug.py version`.
+      placeholder: v26.11 (3029db9)
+    validations:
+      required: true
+  - type: dropdown
+    id: build
+    attributes:
+      label: Build
+      options:
+        - Full (release)
+        - Amateur (release)
+        - Commercial (release)
+        - Built myself (give the make command below)
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - DMR voice
+        - DMR data (text, location, alerts)
+        - FM
+        - Screens, keys, menus
+        - Channels, zones, contacts, codeplug (qdmr, CPS)
+        - Hotspot, SFR, USB network
+        - Battery, power, boot
+        - Installing (rfoundry, web flasher)
+        - Web site or docs
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what the radio did, any message on the screen word for word.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: Link the page of the manual that says so, if there is one.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Channel "Local" (DMR, CC 1, TS 1, TG 9)
+        2. Press PTT for 5 seconds
+        3. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: how-often
+    attributes:
+      label: How often
+      options:
+        - Every time
+        - Sometimes
+        - Once
+    validations:
+      required: true
+  - type: textarea
+    id: other-side
+    attributes:
+      label: The other side
+      description: For calls and data, the other radio or system (model and firmware, repeater, hotspot, network such as BrandMeister).
+  - type: textarea
+    id: crash-log
+    attributes:
+      label: Crash log
+      description: |
+        If the radio restarted or froze, open Settings > Advanced > Crash log before you switch it off (switching off
+        may lose the record) and copy what it shows, or attach a photo of the screen. With the radio on USB,
+        `tools/rfoundry_debug.py crash` prints the same record. "No crash recorded" is worth saying too.
+        [How the crash log works](https://github.com/radiofoundry/radiofoundry/blob/main/docs/user/17-settings.md#crash-log).
+  - type: textarea
+    id: debug
+    attributes:
+      label: Debug link output
+      description: |
+        With the radio on USB: `tools/rfoundry_debug.py view` and `tools/rfoundry_debug.py log`, taken right after the problem.
+        A screenshot: `tools/rfoundry_debug.py screenshot -o shot.png`. Check the output for callsigns or IDs you don't want public.
+      render: text
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Before you send
+      options:
+        - label: I searched the open issues and [docs/spec/gotchas.md](https://github.com/radiofoundry/radiofoundry/blob/main/docs/spec/gotchas.md).
+          required: true
+        - label: Nothing attached is a codec, stock firmware, key, dump or recording.
+          required: true

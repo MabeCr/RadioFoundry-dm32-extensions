@@ -1,0 +1,36 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 The RadioFoundry Authors
+// Power, battery, volume knob and status LEDs
+#ifndef HAL_POWER_H
+#define HAL_POWER_H
+
+#include <stdint.h>
+#include <stdbool.h>
+
+enum { LED_GREEN, LED_RED };
+
+typedef struct {
+	void (*init)(void);
+	// Keep the radio powered (true) or let it turn off (false)
+	void (*latch)(bool on);
+	// battery_mv and battery_pct are read only when the board has a battery (board_has_battery(), CAP_NO_BATTERY unset)
+	uint16_t (*battery_mv)(void);
+	// Battery percentage 0..100 from the board's own curve
+	uint8_t (*battery_pct)(void);
+	// Volume knob position 0..100, or -1 if volume is not a knob the MCU reads
+	int8_t (*volume)(void);
+	// False once the user has switched the radio off (the core then saves and calls latch(false))
+	bool (*switch_on)(void);
+	void (*led)(uint8_t which, bool on);
+	// Optional: microphone level 0..100, logarithmic (about 0.7 dB per step, 0 = silence), for VOX
+	uint8_t (*mic_level)(void);
+	// Optional: run the vibration motor for ms milliseconds and return at once (a call while it runs restarts the time);
+	// NULL when the radio has no motor. The core's vibration alerts use it (core/radio/vibe.c, CONFIG_VIBRATE)
+	void (*vibrate)(uint16_t ms);
+	// Optional: the DC input in mV on a radio without a battery (CAP_NO_BATTERY) that measures its
+	// supply, such as a mobile; NULL otherwise. Shown only: the battery warnings, charge level and
+	// power-off never act on it (board_volts)
+	uint16_t (*supply_mv)(void);
+} hal_power_t;
+
+#endif

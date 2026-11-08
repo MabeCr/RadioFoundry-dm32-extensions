@@ -1,0 +1,215 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 The RadioFoundry Authors
+// Backup bundles (rfoundry-backup/1): everything the flasher could read from a radio, in one zip the user keeps. A bundle
+// is what "restore" takes to put the radio back the way it was (docs/user/02-installing.md, docs/dev/website.md).
+//
+//   backup.json              what's in the bundle: the radio, its firmware before and now, each part's address,
+//                            size, SHA-256 and whether the read was complete
+//   internal-flash.bin       the MCU flash from the application base (the bootloader is never read or written)
+//   spi-flash.bin            the external SPI flash: codeplug, calibration, the stock firmware's resources. As big as
+//                            the radio's chip, which can be smaller than the board's usual one (radios.json backup.spi_size)
+//   security-registers.bin   the SPI flash's security registers (the factory calibration on the DM-1701); not in a
+//                            backup taken over another open firmware's CPS (openfw.js), which never asks area 10
+//   radio-info.bin           the CPS radio info block (open-firmware-cps.md 4)
+//   stock-firmware.bin       the user's stock firmware file, when they gave one (puts stock firmware back)
+//   README.txt               the same in words
+//
+// firmware_now.kind: "rfoundry", or "openfw" for a radio backed up on another open firmware before the install
+// (openfw.js: radio_type, git, built, flash_id from its radio info). Nothing here leaves the user's computer: the bundle is built in the page and saved as a download.
+
+import { equal, hex, sha256 } from "./bytes.js";
+import { zip, unzip } from "./zip.js";
+import { debugLinkReader } from "./readers.js";
+import { parseRadioInfo, flashBytes } from "./link.js";
+
+export const FORMAT = "rfoundry-backup/1";
+// Bundles made before the project was renamed: same layout, the old format id and firmware kind
+const LEGACY_FORMAT = "odr-backup/1";
+const CPS_INFO = 9, CPS_SECURITY = 10, MCU_BASE = 0x08000000;
+export const CODEPLUG_SPAN = 0x120000;	// the open-firmware layout: emulated EEPROM, calibration, codeplug, ID database
+
+export class BackupError extends Error {}
+
+// Read a radio that runs RadioFoundry. what: {internal, spi: "full" | "codeplug" | "none", security}. Returns the parts.
+// readers (readers.js): bulk readers to try first, in order, for the two memories; the debug link reads them when
+// none opens. The small parts the codeplug protocol serves (radio info, security registers) come first, before a
+// reader may hand the radio over to a loader. A build may not serve the security registers there: then a reader is
+// opened for them alone. A reader that reads them (the loader's SREAD, CRC-checked) reads them again, and its copy
+// is the one kept; one that differs from the first keeps that too. A reader that opened is closed (or aborted on a
+// failure) before this returns.
+export async function readRadio(link, board, radio, { what = {}, progress = () => {}, signal, readers = [] } = {}) {
+	const parts = [];
+	const want = { internal: true, spi: "full", security: true, ...what };
+	const step = (name) => (done, total) => progress(name, done, total);
+	// a build without the codeplug protocol's areas refuses these, or doesn't answer them: not the long retries of a
+	// read that must finish
+	const cps = async (area, addr, len) => { try { return await link.cpsRead(area, addr, len, 3); } catch (e) { return null; } };
+	const info = await cps(CPS_INFO, 0, 128);
+	if (info) parts.push({ file: "radio-info.bin", what: "radio-info", addr: 0, data: info, complete: true });
+	let security = null;
+	if (want.security) {
+		const regs = [];
+		for (const a of [0x1000, 0x2000, 0x3000]) {
+			const d = await cps(CPS_SECURITY, a, 256);
+			if (d) regs.push(d);
+		}
+		if (regs.length) {
+			const data = new Uint8Array(regs.reduce((n, d) => n + d.length, 0));
+			let o = 0;
+			for (const d of regs) { data.set(d, o); o += d.length; }
+			security = { file: "security-registers.bin", what: "security-registers", addr: 0x1000, data, complete: regs.length === 3 };
+		}
+	}
+	// A loader bounds the MCU flash by the chip's own size register, which on some parts reads less than the board's
+	// flash (512 KB on a 1 MB chip whose top sectors hold the codec): the loader refuses the top. RadioFoundry reads
+	// the board's whole flash in place, so then it reads the internal flash, before any hand-over. A size it didn't
+	// give (no answer twice) is taken as short too: the read in place is slower, but a loader that refuses the top
+	// fails the whole backup (seen in the field)
+	let internalFirst = false;
+	if (want.internal && readers.length) {
+		const chip = await link.chip().catch(() => null) || await link.chip().catch(() => null);
+		internalFirst = !chip?.flashKb || MCU_BASE + chip.flashKb * 1024 < board.flash_end;
+	}
+	if (internalFirst) {
+		const base = board.app_base, size = board.flash_end - board.app_base;
+		const r = await debugLinkReader(link).read("internal", base, size, { progress: step("internal"), signal });
+		parts.push({ file: "internal-flash.bin", what: "internal-flash", addr: base, data: r.data, complete: r.complete });
+	}
+	let reader = debugLinkReader(link);
+	if (readers.length && ((want.internal && !internalFirst) || want.spi !== "none" || (want.security && !security?.complete))) {
+		await link.cpsClose();	// the debug link's CPS session ends before a reader takes the radio
+		for (const r of readers) {
+			if (await r.open(step("loader"))) {
+				reader = r;
+				break;
+			}
+		}
+	}
+	try {
+		if (want.security && reader.security) {
+			const data = await reader.security();
+			if (data) {
+				if (security && !equal(security.data, data)) parts.push({ ...security, file: "security-registers-codeplug-protocol.bin", what: "security-registers-unchecked", complete: false });
+				security = { file: "security-registers.bin", what: "security-registers", addr: 0x1000, data, complete: true };
+			}
+		}
+		if (security) parts.push(security);
+		if (want.internal && !internalFirst) {
+			const base = board.app_base, size = board.flash_end - board.app_base;
+			const r = await reader.read("internal", base, size, { progress: step("internal"), signal });
+			parts.push({ file: "internal-flash.bin", what: "internal-flash", addr: base, data: r.data, complete: r.complete });
+		}
+		if (want.spi !== "none") {
+			const size = Math.min(want.spi === "full" ? radio.backup.spi_size : CODEPLUG_SPAN, spiBytes(radio, info, reader));
+			const r = await reader.read("spi", 0, size, { progress: step("spi"), signal });
+			parts.push({ file: "spi-flash.bin", what: "spi-flash", addr: 0, data: r.data, complete: r.complete && want.spi === "full" });
+		}
+	} catch (e) {
+		await reader.abort();
+		throw e;
+	}
+	await reader.close();
+	return parts;
+}
+
+// The radio's SPI flash in bytes: the board's (radios.json backup.spi_size), or less when the radio reports a smaller
+// chip, in its radio info (info: its raw bytes) or the reader's own probe (the loader's HELLO). Some radios of a model
+// came with a smaller chip; a read past its end is refused, or wraps around to its start
+export function spiBytes(radio, info, reader = null) {
+	const sizes = [radio.backup.spi_size, flashBytes(parseRadioInfo(info)?.flashId), reader?.spiSize].filter((n) => n > 0);
+	return Math.min(...sizes);
+}
+
+// meta: {radio: {board, name, chip, version}, firmware_now, firmware_before, notes}
+export async function makeBundle(meta, parts, site = {}) {
+	const files = [];
+	const listed = [];
+	for (const p of parts) {
+		listed.push({ file: p.file, what: p.what, addr: hex(p.addr), size: p.data.length, sha256: await sha256(p.data), complete: p.complete });
+		files.push({ name: p.file, data: p.data });
+	}
+	const doc = { format: FORMAT, created: new Date().toISOString(), tool: { site: site.git || "", url: site.url || "" }, ...meta, parts: listed };
+	const readme = [
+		`RadioFoundry backup of a ${meta.radio.name}, ${doc.created}`,
+		meta.radio.chip ? `Chip UID ${meta.radio.chip.uid}` : "",
+		`Firmware when the backup was taken: ${describeFirmware(meta.firmware_now)}`,
+		meta.firmware_before ? `Firmware before RadioFoundry was installed: ${describeFirmware(meta.firmware_before)}` : "",
+		"",
+		"Keep this file. The RadioFoundry radio programming utility (Restore) can restore the radio from it.",
+		"It contains your radio's calibration and codeplug. Do not share it.",
+		"",
+		...listed.map((p) => `${p.file}: ${p.what} at ${p.addr}, ${p.size} bytes${p.complete ? "" : " (incomplete read)"}, sha256 ${p.sha256}`),
+	].filter((l, i, a) => l !== "" || a[i - 1] !== "").join("\n") + "\n";
+	return zip([{ name: "backup.json", data: JSON.stringify(doc, null, 1) }, { name: "README.txt", data: readme }, ...files]);
+}
+
+export function describeFirmware(f) {
+	if (!f) return "unknown";
+	if (f.kind === "rfoundry") return `RadioFoundry ${f.git || ""} (codec ${f.codec || "?"})`.trim();
+	if (f.kind === "stock") return `stock ${f.version || "(version unknown)"}`;
+	// another open firmware, backed up over its CPS (openfw.js)
+	if (f.kind === "openfw") return `another open firmware ${f.git || "?"} (built ${f.built || "?"}, CPS radio type ${f.radio_type ?? "?"})`;
+	return "unknown";
+}
+
+// The name people see in their downloads or on the desktop: the model and the local date, letters and digits only,
+// always .zip (DM1801Pro_Backup_2026-10-16.zip)
+export function bundleName(meta, when = new Date()) {
+	const p = (n) => String(n).padStart(2, "0");
+	const model = String(meta.radio.model || meta.radio.board).replace(/[^A-Za-z0-9]/g, "") || "Radio";
+	return `${model}_Backup_${when.getFullYear()}-${p(when.getMonth() + 1)}-${p(when.getDate())}.zip`;
+}
+
+// Where a zip's files (name -> bytes) keep backup.json: "" at the top, "name/" for a backup unpacked and zipped again
+// (macOS opens a downloaded zip by itself; Compress then adds its folder and __MACOSX/), "a/b/" for a folder zipped
+// with the unpacked one inside, null when it isn't a backup (none, or several backups in one zip)
+export function bundleFolder(files) {
+	if (files.has("backup.json")) return "";
+	const found = [...files.keys()].filter((k) => !k.startsWith("__MACOSX/") && /\/backup\.json$/.test(k));
+	return found.length === 1 ? found[0].slice(0, -"backup.json".length) : null;
+}
+
+// The files a backup holds (readRadio's parts, the cable radios' in c7000ui.js saveBundle, the stock file, the index
+// and its README), as a picked file is named: a browser saves a second download as "name (1).bin"
+const BUNDLE_FILES = new Set(["backup.json", "README.txt", "internal-flash.bin", "spi-flash.bin", "security-registers.bin",
+	"security-registers-codeplug-protocol.bin", "radio-info.bin", "stock-firmware.bin", "program-memory.bin", "data-memory.bin",
+	"nand.bin", "original-channels.bin", "calibration.bin", "calibration-program-memory.bin"]);
+const bundleFile = (path) => BUNDLE_FILES.has(path.split("/").pop().replace(/ \(\d+\)(?=\.\w+$)/, ""));
+const CODEPLUG_EXT = /\.(rdt|dat|ya?ml|csv)$/i;
+
+// What a file picked as a backup is when it isn't one (no zip, or a zip without backup.json), so the restore can say what
+// to pick instead (OPENDIGITALRADIO-12, -1S): {kind: "part", file}: one file from inside a backup (it was unpacked);
+// "parts": a zip of a backup's files without its backup.json; "codeplug": the Codeplug Editor's file (the open-firmware
+// layout's size) or a CPS one; "other": anything else, which may be an original firmware file (vendorfile.js decides).
+// files: the zip's entries, or null when it is no zip
+export function notBundle(name, bytes, files) {
+	if (!files && bundleFile(name)) return { kind: "part", file: name };
+	if (files && [...files.keys()].some((k) => !k.startsWith("__MACOSX/") && bundleFile(k) && !k.endsWith("README.txt"))) return { kind: "parts" };
+	if (!files && (bytes.length === CODEPLUG_SPAN || CODEPLUG_EXT.test(name))) return { kind: "codeplug" };
+	return { kind: "other" };
+}
+
+// Read a bundle back; every part checked against its SHA-256. Returns {meta, parts: Map(what -> {..., data})}
+export async function openBundle(bytes) {
+	let files;
+	try {
+		files = await unzip(bytes);
+	} catch (e) {
+		throw new BackupError(`this file is not a backup created by the radio programming utility (${e.message})`);
+	}
+	const top = bundleFolder(files) ?? "";
+	const doc = files.get(top + "backup.json");
+	if (!doc) throw new BackupError("this file is not a backup created by the radio programming utility (no backup.json)");
+	const meta = JSON.parse(new TextDecoder().decode(doc));
+	if (meta.format !== FORMAT && meta.format !== LEGACY_FORMAT) throw new BackupError(`unknown backup format ${meta.format}`);
+	for (const k of ["firmware_now", "firmware_before"])
+		if (meta[k]?.kind === "odr") meta[k].kind = "rfoundry";
+	const parts = new Map();
+	for (const p of meta.parts) {
+		const data = files.get(top + p.file);
+		if (!data) throw new BackupError(`${p.file} is missing from the backup file`);
+		if (await sha256(data) !== p.sha256) throw new BackupError(`${p.file} does not match its checksum; the backup file is damaged`);
+		parts.set(p.what, { ...p, addr: Number(p.addr), data });
+	}
+	return { meta, parts };
+}

@@ -1,0 +1,93 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 The RadioFoundry Authors
+#
+# The UI screen gallery before and after a pull request that changes the UI (docs/dev/ci.md "UI gallery"). This job
+# renders every screen twice, from the base commit and from the pull request's merge commit, and puts each changed
+# screen side by side in the `ui-gallery` artifact. ui-gallery-comment.yml posts it on the pull request.
+#
+# This job runs the pull request's code (uiSim is built from its tree), so it is a plain pull_request run: a read-only
+# token, no secrets, no cache, nothing a fork couldn't have, on GitHub's runners; a fork's run waits for a maintainer's
+# approval. It never writes to the repository or the pull request; the comment job does that, from main's copy of its
+# workflow, and never runs anything from the artifact.
+name: UI gallery
+
+on:
+  pull_request:
+    paths:
+      - "core/ui/**"
+      - "core/radio/tones.c"
+      - "core/codeplug/codeplug_talk.c"
+      - "tests/host/Makefile"
+      - "tests/host/uiSim.c"
+      - "tests/host/sim/**"
+      - "tools/ui_gallery_compare.py"
+      - "tools/gen_about.py"
+      - "AUTHORS"
+      - ".github/workflows/ui-gallery.yml"
+
+permissions:
+  contents: read
+
+# The highlight colors the gallery draws its color pages in (Settings > Display > Highlight color), in the order the
+# comment shows them: any of red orange yellow teal light_blue purple pink. `make -C tests/host ui-gallery` reads this
+# line too, so the committed gallery shows the same colors: keep it on one line, in double quotes.
+env:
+  UI_GALLERY_COLORS: "red yellow light_blue"
+
+concurrency:
+  group: ui-gallery-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  render:
+    # a public repository always (a fork's run may not get repository variables); a private copy when it opts in
+    if: (github.server_url != 'https://github.com' || !github.event.repository.private || vars.RFOUNDRY_CI_GITHUB == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: false   # the host tests use none of third_party
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          persist-credentials: false
+          submodules: false
+
+      - name: Install Pillow
+        run: |
+          set -eu
+          if [ "${RFOUNDRY_CI_IMAGE:-}" != 1 ]; then   # the self-hosted runner's image has these already
+            sudo apt-get update -qq
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends python3-pil
+          fi
+
+      - name: Render the gallery at the base and at the pull request
+        run: |
+          set -eu
+          mkdir -p build/ui   # uiSim makes the gallery directory itself, not its parents
+          make -s -C tests/host uiSim
+          tests/host/uiSim --gallery build/ui/after > /dev/null
+          make -s -C base/tests/host uiSim
+          base/tests/host/uiSim --gallery build/ui/before > /dev/null
+
+      - name: Side-by-side changed screens
+        run: |
+          set -eu
+          python3 tools/ui_gallery_compare.py build/ui/before build/ui/after build/ui/out \
+            --base-sha "${{ github.event.pull_request.base.sha }}" \
+            --head-sha "${{ github.event.pull_request.head.sha }}" \
+            --pr "${{ github.event.pull_request.number }}" \
+            --colors "$UI_GALLERY_COLORS"
+          python3 -c 'import json; print(json.load(open("build/ui/out/manifest.json"))["counts"])' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
+        with:
+          name: ui-gallery
+          path: build/ui/out
+          if-no-files-found: error
+          retention-days: 30

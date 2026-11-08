@@ -1,0 +1,446 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 The RadioFoundry Authors
+// FD6818 transceiver driver (docs/spec/hardware-dm32.md 8)
+#include <stddef.h>
+#include "fd6818.h"
+#include "rf/subaudio/subaudio.h"
+
+#define RESET_MS	10u
+
+typedef fd6818_regval_t regval_t;
+
+// 8.2 power-on init, in order (register 0x09 is a 16-entry table indexed by its top nibble). The earlier port also
+// sent 0xB3, 0xB4 (and 0xC7 in the DMR set): with bit 7 set those are read cycles, during which the MCU kept driving
+// the data line against the chip. The radio's own firmware never sends them, so they are left out
+static const regval_t init_table[] = {
+	{ 0x00, 0x8000 }, { 0x00, 0x0000 }, { 0x37, 0x1D0F }, { 0x13, 0x03BE }, { 0x12, 0x037B }, { 0x11, 0x027B },
+	{ 0x10, 0x007A }, { 0x14, 0x0019 }, { 0x49, 0x2A38 }, { 0x7B, 0x8420 }, { 0x48, 0x33EF }, { 0x1F, 0x5454 },
+	{ 0x25, 0xC1BA }, { 0x77, 0x88EF }, { 0x3E, 0xA037 }, { 0x13, 0x037E }, { 0x7D, 0xE35E }, { 0x33, 0xFE00 },
+	{ 0x34, 0x0009 }, { 0x33, 0xFC00 }, { 0x34, 0x0019 }, { 0x10, 0x007A }, { 0x11, 0x027B }, { 0x12, 0x037B },
+	{ 0x13, 0x03BE }, { 0x14, 0x0019 }, { 0x1F, 0x5454 }, { 0x30, 0xBFF1 }, { 0x37, 0x1D1F }, { 0x3E, 0xA037 }, { 0x47, 0x0100 }, { 0x48, 0xBBBF },
+	{ 0x49, 0x2A38 }, { 0x4E, 0x4708 }, { 0x4F, 0x302F }, { 0x52, 0x028F }, { 0x7B, 0x8420 },
+	{ 0x09, 0x006F }, { 0x09, 0x106B }, { 0x09, 0x2067 }, { 0x09, 0x3062 }, { 0x09, 0x4050 }, { 0x09, 0x5047 },
+	{ 0x09, 0x603A }, { 0x09, 0x702C }, { 0x09, 0x8041 }, { 0x09, 0x9037 }, { 0x09, 0xA025 }, { 0x09, 0xB017 },
+	{ 0x09, 0xC0E4 }, { 0x09, 0xD0CB }, { 0x09, 0xE0B5 }, { 0x09, 0xF09F },
+};
+
+// 8.2 post-init: receiver parked at 144.000 MHz, AF muted, volume
+static const regval_t post_init_table[] = {
+	{ 0x47, 0x0000 }, { 0x13, 0x037E }, { 0x47, 0x6042 }, { 0x7E, 0x302E }, { 0x2B, 0xC000 }, { 0x43, 0x3028 },
+	{ 0x78, 0x6968 }, { 0x30, 0x0000 }, { 0x38, 0xBA00 }, { 0x39, 0x00DB }, { 0x32, 0x0244 }, { 0x07, 0x0470 },
+	{ 0x07, 0x21CE }, { 0x51, 0x0000 }, { 0x3F, 0x0000 }, { 0x37, 0x1F0F }, { 0x30, 0x0000 }, { 0x30, 0xBFF1 },
+	{ 0x47, 0x6042 }, { 0x48, 0xBBBF },
+};
+
+// 0x47 = 0x0140 puts the demodulated audio on the chip's output, which the speaker plays in FM receive (checked on the
+// radio: the 0x6042 of the radio's own FM sequence leaves that output silent)
+static const regval_t fm_table[] = {
+	{ 0x30, 0x0000 }, { 0x13, 0x037E }, { 0x47, 0x0140 }, { 0x7E, 0x302E }, { 0x2B, 0xC000 }, { 0x43, 0x3028 },
+	{ 0x07, 0x0470 }, { 0x07, 0x21CE }, { 0x51, 0x0000 }, { 0x3F, 0x0000 }, { 0x37, 0x1F0F }, { 0x30, 0x0000 },
+	{ 0x30, 0xBFF1 }, { 0x47, 0x0140 }, { 0x48, 0xBBBF },
+};
+
+static const regval_t dmr_table[] = {
+	{ 0x47, 0x0000 }, { 0x30, 0x0000 }, { 0x30, 0x0000 }, { 0x13, 0x037E }, { 0x47, 0x0140 }, { 0x48, 0xBBBF },
+	{ 0x7E, 0xB03F }, { 0x2B, 0x0700 }, { 0x43, 0x4048 }, { 0x78, 0x6968 }, { 0x30, 0x0000 }, { 0x32, 0x0244 },
+	{ 0x37, 0x1F1F }, { 0x30, 0x0000 }, { 0x30, 0xBFF1 }, { 0x47, 0x0140 }, { 0x3F, 0x0000 }, { 0x47, 0x0140 },
+};
+
+// 8.3 band select: first row whose threshold the frequency reaches (10 Hz units)
+static const struct {
+	uint32_t from;
+	uint16_t r1a, r40;
+} bands[] = {
+	{ 73999999u, 0x1F80, 0x3AF0 }, { 36999999u, 0x2F50, 0x39F0 }, { 26000000u, 0x9F30, 0x385C },
+	{ 18499999u, 0x3F48, 0x38F0 }, { 12399999u, 0xAF28, 0x375C }, { 9299999u, 0x4F44, 0x37F0 },
+	{ 6199999u, 0xBF24, 0x365C }, { 4699999u, 0x5F42, 0x36F0 }, { 3099999u, 0xCF22, 0x355C },
+	{ 2399999u, 0x6F41, 0x35F0 }, { 1599999u, 0xDF21, 0x345C },
+};
+
+bool fd6818_band_words(uint32_t freq_10hz, uint16_t *r1a, uint16_t *r40)
+{
+	for (size_t i = 0; i < sizeof(bands) / sizeof(bands[0]); i++) {
+		if (freq_10hz >= bands[i].from) {
+			*r1a = bands[i].r1a;
+			*r40 = bands[i].r40;
+			return true;
+		}
+	}
+	return false;
+}
+
+#define TBL_N(t)	(uint16_t)(sizeof(t) / sizeof((t)[0]))
+
+static const regval_t rx_default[] = { { 0x30, FD6818_STATE_RX } };
+static const regval_t tx_default[] = { { 0x30, FD6818_STATE_TX } };
+static const regval_t fm_tx_prepare_default[] = { { 0x3F, 0x0000 }, { 0x40, 0x34EA }, { 0x37, 0x1D0F } };
+
+const fd6818_variant_t fd6818_variant_default = {
+	.init = init_table, .init_n = TBL_N(init_table),
+	.post_init = post_init_table, .post_init_n = TBL_N(post_init_table),
+	.fm = fm_table, .fm_n = TBL_N(fm_table),
+	.dmr = dmr_table, .dmr_n = TBL_N(dmr_table),
+	.rx = rx_default, .rx_n = TBL_N(rx_default),
+	.tx = tx_default, .tx_n = TBL_N(tx_default),
+	.fm_tx_prepare = fm_tx_prepare_default, .fm_tx_prepare_n = TBL_N(fm_tx_prepare_default),
+	.bw_fm_25k = FD6818_BW_FM_25K, .bw_fm_12k5 = FD6818_BW_FM_12K5, .bw_dmr = FD6818_BW_DMR,
+	.band_words = fd6818_band_words,
+	.park_10hz = 14400000u,
+};
+
+#define RSSI_CAL_BAND_GAP_MHZ	100u
+
+int8_t fd6818_rssi_cal_db(const fd6818_rssi_cal_t *t, uint8_t n, uint32_t hz)
+{
+	if (t == NULL || n == 0) {
+		return 0;
+	}
+	uint32_t khz = hz / 1000u;
+	if (khz <= t[0].mhz * 1000u) {
+		return t[0].db;
+	}
+	for (uint8_t i = 1; i < n; i++) {
+		uint32_t lo = t[i - 1].mhz * 1000u, hi = t[i].mhz * 1000u;
+		if (khz > hi) {
+			continue;
+		}
+		if (hi - lo > RSSI_CAL_BAND_GAP_MHZ * 1000u) {
+			return khz - lo < hi - khz ? t[i - 1].db : t[i].db;	// between the bands: the nearer end
+		}
+		int32_t d = (int32_t)(t[i].db - t[i - 1].db) * (int32_t)(khz - lo);
+		int32_t span = (int32_t)(hi - lo);
+		d += d >= 0 ? span / 2 : -span / 2;	// rounded
+		return (int8_t)(t[i - 1].db + d / span);
+	}
+	return t[n - 1].db;
+}
+
+void fd6818_attach(fd6818_t *dev, rfbus_t *bus)
+{
+	fd6818_attach_variant(dev, bus, &fd6818_variant_default);
+}
+
+void fd6818_attach_variant(fd6818_t *dev, rfbus_t *bus, const fd6818_variant_t *variant)
+{
+	dev->bus = bus;
+	dev->variant = variant;
+	dev->freq_10hz = 0;
+	dev->bw_reg = 0;
+	dev->state = 0;
+#if CONFIG_AM_RX
+	dev->am = false;
+	dev->am_noise_off = 0;
+	dev->r13 = 0;
+	dev->r4a = 0;
+	fd6818_agc_reset(&dev->agc);
+#endif
+}
+
+void fd6818_write(fd6818_t *dev, uint8_t reg, uint16_t val)
+{
+	rfbus_write(dev->bus, reg, val);
+	if (reg == FD6818_REG_STATE) {
+		dev->state = val;
+	} else if (reg == FD6818_REG_BANDWIDTH) {
+		dev->bw_reg = val;
+	}
+}
+
+uint16_t fd6818_read(fd6818_t *dev, uint8_t reg)
+{
+	return rfbus_read(dev->bus, reg);
+}
+
+static void write_table(fd6818_t *dev, const regval_t *t, size_t n)
+{
+	for (size_t i = 0; i < n; i++) {
+		fd6818_write(dev, t[i].reg, t[i].val);
+	}
+}
+
+void fd6818_init(fd6818_t *dev)
+{
+	const fd6818_variant_t *v = dev->variant;
+	fd6818_write(dev, v->init[0].reg, v->init[0].val);	// soft reset
+	rfbus_delay_ms(dev->bus, RESET_MS);
+	write_table(dev, v->init + 1, (size_t)v->init_n - 1);
+	write_table(dev, v->post_init, v->post_init_n);
+	dev->freq_10hz = v->park_10hz;
+}
+
+void fd6818_set_mode(fd6818_t *dev, fd6818_mode_t mode)
+{
+	const fd6818_variant_t *v = dev->variant;
+#if CONFIG_AM_RX
+	fd6818_set_am(dev, false);	// 0x4A: the mode tables don't write it
+#endif
+	if (mode == FD6818_MODE_DMR) {
+		if (v->dmr != NULL) {
+			write_table(dev, v->dmr, v->dmr_n);
+		}
+	} else {
+		write_table(dev, v->fm, v->fm_n);
+	}
+}
+
+void fd6818_set_freq(fd6818_t *dev, uint32_t hz)
+{
+	uint32_t f = (hz + 5u) / 10u;
+	uint16_t r1a, r40;
+	fd6818_write(dev, FD6818_REG_STATE, FD6818_STATE_IDLE);
+	if (dev->variant->band_words(f, &r1a, &r40)) {
+		if (r1a != 0) {
+			fd6818_write(dev, FD6818_REG_BAND_A, r1a);
+		}
+		fd6818_write(dev, FD6818_REG_BAND_B, r40);
+	}
+	fd6818_write(dev, FD6818_REG_FREQ_LO, (uint16_t)(f & 0xFFFFu));
+	fd6818_write(dev, FD6818_REG_FREQ_HI, (uint16_t)(f >> 16));
+	dev->freq_10hz = f;
+}
+
+void fd6818_set_bandwidth(fd6818_t *dev, uint16_t bw_reg)
+{
+	fd6818_write(dev, FD6818_REG_BANDWIDTH, bw_reg);
+}
+
+void fd6818_set_state(fd6818_t *dev, uint16_t state)
+{
+	const fd6818_variant_t *v = dev->variant;
+	if (state != FD6818_STATE_IDLE && dev->state != FD6818_STATE_IDLE) {
+		fd6818_write(dev, FD6818_REG_STATE, FD6818_STATE_IDLE);	// never RX <-> TX directly
+	}
+	if (state == FD6818_STATE_RX) {
+		write_table(dev, v->rx, v->rx_n);
+	} else if (state == FD6818_STATE_TX) {
+		write_table(dev, v->tx, v->tx_n);
+	} else {
+		fd6818_write(dev, FD6818_REG_STATE, state);
+	}
+}
+
+void fd6818_fm_tx_prepare(fd6818_t *dev)
+{
+	write_table(dev, dev->variant->fm_tx_prepare, dev->variant->fm_tx_prepare_n);
+}
+
+void fd6818_set_tx_ctcss(fd6818_t *dev, uint16_t hz_x10)
+{
+	if (hz_x10 == 0) {
+		fd6818_write(dev, FD6818_REG_SUBAUDIO, 0x0000);
+		return;
+	}
+	fd6818_write(dev, FD6818_REG_CTCSS_FREQ, subaudio_ctcss_word(hz_x10, true));
+	fd6818_write(dev, FD6818_REG_SUBAUDIO, 0x9045);	// TX CTCSS on, gain 0x45
+}
+
+// 0x51: b15 sub-audio on, b13 DCS inverted, b12 CTCSS (0 = DCS); b6:0 gain
+#define SUBAU_ON	0x8000u
+#define SUBAU_DCS_INV	0x2000u
+#define SUBAU_CTCSS	0x1000u
+#define SUBAU_GAIN	0x45u
+#define CTCSS_WORD_ALT	0x2000u		// 0x07 bit 13: the second tone word (the tail tone)
+#define DCS_RATE_WORD	0x0AD7u		// 134.4 Hz, the DCS bit rate
+#define DCS_HIGH_HALF	0x8000u
+
+void fd6818_set_rx_tone(fd6818_t *dev, fd6818_tone_t type, uint16_t value)
+{
+	switch (type) {
+	case FD6818_TONE_CTCSS:
+		fd6818_write(dev, FD6818_REG_CTCSS_FREQ, subaudio_ctcss_word(value, true));
+		fd6818_write(dev, FD6818_REG_CTCSS_FREQ, CTCSS_WORD_ALT | 0x01CEu);
+		fd6818_write(dev, FD6818_REG_CSS_THRESH, 0x028F);
+		fd6818_write(dev, FD6818_REG_SUBAUDIO, SUBAU_ON | SUBAU_CTCSS | SUBAU_GAIN);
+		break;
+	case FD6818_TONE_DCS:
+	case FD6818_TONE_DCS_INV: {
+		uint32_t word = subaudio_dcs_word(value);
+		fd6818_write(dev, FD6818_REG_CTCSS_FREQ, DCS_RATE_WORD);	// the rate first
+		fd6818_write(dev, FD6818_REG_DCS_CODE, (uint16_t)(word & 0xFFFu));
+		fd6818_write(dev, FD6818_REG_DCS_CODE, (uint16_t)(DCS_HIGH_HALF | ((word >> 12) & 0xFFFu)));
+		fd6818_write(dev, FD6818_REG_SUBAUDIO,
+			(uint16_t)(SUBAU_ON | (type == FD6818_TONE_DCS_INV ? SUBAU_DCS_INV : 0u) | SUBAU_GAIN));
+		break;
+	}
+	default:
+		fd6818_write(dev, FD6818_REG_CTCSS_FREQ, 0x0470);
+		fd6818_write(dev, FD6818_REG_CTCSS_FREQ, CTCSS_WORD_ALT | 0x01CEu);
+		fd6818_write(dev, FD6818_REG_SUBAUDIO, 0x0000);
+		break;
+	}
+}
+
+bool fd6818_tone_found(uint16_t r0c, fd6818_tone_t type)
+{
+	switch (type) {
+	case FD6818_TONE_CTCSS: return (r0c & (1u << 10)) != 0;
+	case FD6818_TONE_DCS: return (r0c & (1u << 14)) != 0;
+	case FD6818_TONE_DCS_INV: return (r0c & (1u << 15)) != 0;
+	default: return true;
+	}
+}
+
+bool fd6818_rx_tone_ok(fd6818_t *dev, fd6818_tone_t type)
+{
+	return type == FD6818_TONE_NONE || fd6818_tone_found(fd6818_read(dev, FD6818_REG_CSS_STATUS), type);
+}
+
+#if CONFIG_AM_RX
+static bool last_in(const regval_t *t, uint16_t n, uint8_t reg, uint16_t *val)
+{
+	for (uint16_t i = n; i > 0; i--) {
+		if (t[i - 1].reg == reg) {
+			*val = t[i - 1].val;
+			return true;
+		}
+	}
+	return false;
+}
+
+// What FM receive has in reg: the FM table's last write, else post-init's, else init's
+static bool fm_value(const fd6818_variant_t *v, uint8_t reg, uint16_t *val)
+{
+	return last_in(v->fm, v->fm_n, reg, val) || last_in(v->post_init, v->post_init_n, reg, val) ||
+		last_in(v->init, v->init_n, reg, val);
+}
+
+void fd6818_set_am(fd6818_t *dev, bool am)
+{
+	if (am) {
+		if (!dev->am) {
+			// FM's 0x13 and 0x4A differ by board: the last value the variant's tables write, or the chip's own
+			if (!fm_value(dev->variant, FD6818_REG_GAIN, &dev->r13)) {
+				dev->r13 = fd6818_read(dev, FD6818_REG_GAIN);
+			}
+			if (!fm_value(dev->variant, FD6818_REG_AM_4A, &dev->r4a)) {
+				dev->r4a = fd6818_read(dev, FD6818_REG_AM_4A);
+			}
+			// The squelch's level 1 at the chip's own noise threshold, as this board sets it
+			uint16_t r4f;
+			if (!fm_value(dev->variant, FD6818_REG_SQ_NOISE, &r4f)) {
+				r4f = fd6818_read(dev, FD6818_REG_SQ_NOISE);
+			}
+			dev->am_noise_off = fd6818_am_noise_offset(r4f);
+		}
+		fd6818_write(dev, FD6818_REG_AF, FD6818_AF_AM);
+		fd6818_write(dev, FD6818_REG_GAIN, FD6818_GAIN_AM_FULL);
+		fd6818_write(dev, FD6818_REG_AM_4A, FD6818_AM_4A);
+		fd6818_agc_reset(&dev->agc);
+	} else if (dev->am) {
+		fd6818_write(dev, FD6818_REG_GAIN, dev->r13);
+		fd6818_write(dev, FD6818_REG_AF, FD6818_AF_FM);
+		fd6818_write(dev, FD6818_REG_AM_4A, dev->r4a);
+	}
+	dev->am = am;
+}
+
+bool fd6818_am_status(fd6818_t *dev, uint16_t r65, uint16_t r67, int16_t *rssi_dbm, uint8_t *noise)
+{
+	if (!dev->am) {
+		return false;
+	}
+	// The reading and the gain it was taken at, before the loop's step changes the gain
+	*rssi_dbm = (int16_t)(*rssi_dbm + fd6818_agc_atten_db(&dev->agc));
+	*noise = fd6818_am_noise(r65, dev->am_noise_off);
+	if (fd6818_agc_step(&dev->agc, r67)) {
+		fd6818_write(dev, FD6818_REG_GAIN, fd6818_agc_word(&dev->agc));
+	}
+	return true;
+}
+
+// The gain loop's 0x13 words, lowest gain first, with the gain each gives against the last (full gain, 0x3FF)
+static const struct {
+	uint16_t word;
+	int8_t db;
+} agc_table[] = {
+	{ 0x000, -93 }, { 0x008, -91 }, { 0x010, -88 }, { 0x001, -87 }, { 0x009, -85 }, { 0x011, -82 }, { 0x002, -81 },
+	{ 0x00A, -79 }, { 0x012, -76 }, { 0x003, -75 }, { 0x00B, -73 }, { 0x013, -70 }, { 0x004, -69 }, { 0x00C, -67 },
+	{ 0x00D, -64 }, { 0x01C, -61 }, { 0x01D, -58 }, { 0x01E, -55 }, { 0x01F, -52 }, { 0x03E, -50 }, { 0x03F, -47 },
+	{ 0x05E, -45 }, { 0x05F, -42 }, { 0x07E, -40 }, { 0x07F, -37 }, { 0x09F, -34 }, { 0x0BF, -32 }, { 0x0DF, -30 },
+	{ 0x0FF, -28 }, { 0x1DF, -26 }, { 0x1FF, -24 }, { 0x2BF, -23 }, { 0x2DF, -21 }, { 0x2FF, -19 }, { 0x35E, -17 },
+	{ 0x35F, -14 }, { 0x37E, -12 }, { 0x37F, -9 }, { 0x38F, -6 }, { 0x3BF, -4 }, { 0x3DF, -2 }, { 0x3FF, 0 },
+};
+#define AGC_TOP		(uint8_t)(sizeof(agc_table) / sizeof(agc_table[0]) - 1u)
+#define AGC_NO_PREV	0xFFFFu
+#define AGC_CUT_FROM	10	// dB over the target that takes the gain down
+#define AGC_CUT_SPARE	8	// dB of that excess left in
+#define AGC_RAISE_BELOW	(-6)	// dB under the target that raises the gain
+
+void fd6818_agc_reset(fd6818_agc_t *a)
+{
+	a->idx = AGC_TOP;
+	a->hold = 0;
+	a->prev = AGC_NO_PREV;
+}
+
+bool fd6818_agc_step(fd6818_agc_t *a, uint16_t r67)
+{
+	uint16_t raw = r67 & 0x1FFu;
+	uint16_t avg = a->prev == AGC_NO_PREV ? raw : (uint16_t)((raw + a->prev) / 2u);
+	a->prev = raw;
+	int32_t db = ((int32_t)avg - (int32_t)FD6818_AGC_TARGET) / 2;	// the reading is in 0.5 dB steps
+	uint8_t idx = a->idx;
+	if (db >= AGC_CUT_FROM) {
+		int32_t want = agc_table[idx].db - (db - AGC_CUT_SPARE);
+		while (idx > 0 && agc_table[idx].db > want) {
+			idx--;
+		}
+	} else if (db < AGC_RAISE_BELOW && a->hold == 0 && idx < AGC_TOP) {
+		idx++;
+	}
+	bool changed = idx != a->idx;
+	a->idx = idx;
+	if (changed || db >= AGC_RAISE_BELOW) {
+		a->hold = FD6818_AGC_HOLD;
+	} else if (a->hold > 0) {
+		a->hold--;
+	}
+	return changed;
+}
+
+uint16_t fd6818_agc_word(const fd6818_agc_t *a)
+{
+	return agc_table[a->idx].word;
+}
+
+uint8_t fd6818_agc_atten_db(const fd6818_agc_t *a)
+{
+	return (uint8_t)-agc_table[a->idx].db;
+}
+#endif	// CONFIG_AM_RX
+
+void fd6818_rx_sleep(fd6818_t *dev, bool sleep, fd6818_mode_t mode)
+{
+	if (sleep) {
+		fd6818_write(dev, FD6818_REG_STATE, FD6818_STATE_IDLE);
+		fd6818_write(dev, FD6818_REG_POWER, mode == FD6818_MODE_DMR ? 0x1D00 : 0x1D11);
+	} else {
+		fd6818_write(dev, FD6818_REG_POWER, 0x1F1F);
+		fd6818_write(dev, FD6818_REG_POWER, 0x1F0F);
+	}
+}
+
+void fd6818_dmr_burst(fd6818_t *dev, bool tx, uint16_t rx_bw)
+{
+	const fd6818_variant_t *v = dev->variant;
+	if (tx ? v->burst_tx != NULL : v->burst_rx != NULL) {
+		write_table(dev, tx ? v->burst_tx : v->burst_rx, tx ? v->burst_tx_n : v->burst_rx_n);
+		return;
+	}
+	if (tx) {
+		fd6818_write(dev, FD6818_REG_STATE, FD6818_STATE_IDLE);
+		write_table(dev, dev->variant->tx, dev->variant->tx_n);
+	} else {
+		fd6818_write(dev, FD6818_REG_BANDWIDTH, rx_bw);
+		fd6818_write(dev, FD6818_REG_STATE, FD6818_STATE_IDLE);
+		write_table(dev, dev->variant->rx, dev->variant->rx_n);
+	}
+}
+
+void fd6818_dmr_burst_at(fd6818_t *dev, bool tx, uint16_t rx_bw, uint32_t hz)
+{
+	if (hz != 0 && (hz + 5u) / 10u != dev->freq_10hz) {
+		fd6818_set_freq(dev, hz);	// leaves the chip idle, as the burst switch below expects
+	}
+	fd6818_dmr_burst(dev, tx, rx_bw);
+}

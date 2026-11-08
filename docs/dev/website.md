@@ -1,0 +1,359 @@
+<!-- SPDX-License-Identifier: MIT -->
+
+# The Web Site
+
+The site is generated from the repository, like the PDF manual. It lists the radios, their screens
+and features, holds the documentation, and carries two tools that run in the browser with nothing sent to a server:
+the web flasher (back up, install, restore; [web-flasher.md](web-flasher.md)) and the Codeplug Editor
+([codeplug-editor.md](codeplug-editor.md)). The site is the recommended way for users to install RadioFoundry and edit
+a codeplug ([Installing](../user/02-installing.md)); this page is for people who change it.
+
+```
+python3 site/build.py                       # build/site/
+python3 site/build.py --serve               # build, then http://localhost:8000 (WebUSB needs localhost or https)
+python3 site/build.py --firmware build/dist # with release images for the flasher (tools/release.py --out)
+python3 site/build.py --strict              # any warning fails (CI)
+site/tests/run.sh                           # the flasher's and the editor's tests (Node 20+)
+```
+
+The generator needs two Python packages, markdown-it-py and resvg_py (`pip install -r site/requirements.txt`, or prefix the
+command with `uv run --no-project --with-requirements site/requirements.txt`). The pages need no build step and no
+npm packages: plain HTML, CSS and ES modules. `tools/ci.sh` builds the site and runs the tests (Python step).
+
+Cloudflare Pages builds and deploys it (see [Hosting](#hosting)):
+
+| Event | Does |
+|---|---|
+| Push to `main` | Builds the site with `site/cloudflare-build.sh` and deploys it to radiofoundry.org |
+| Push to another branch of this repository | Builds a preview at its own `*.radiofoundry.pages.dev` address; a pull request shows the link. Pull requests from forks get no preview |
+| Release published | `.github/workflows/site.yml` calls the project's deploy hook, so `main` is built again with the new release's images for the flasher |
+| By hand | Actions > Web site > Run workflow (the same deploy hook), or Retry deployment in the Pages project |
+
+The pull request's unit tests job also builds the site (`--strict`) and runs the flasher's tests (`tools/ci.sh`'s
+Python step).
+
+## Hosting
+
+The site is static files on Cloudflare Pages, project `radiofoundry`, connected to this repository through
+Cloudflare's GitHub app. Pages builds in its own build image (Python and Node.js preinstalled) and switches the site to
+a new deployment in one step, so a deployment has no downtime.
+
+| Part | Setup |
+|---|---|
+| Build | Command `site/cloudflare-build.sh`, output directory `build/site`, root directory the repository root. The script installs `site/requirements.txt`, lists the releases through the GitHub API, fetches the `rfoundry-*` images of the newest one that is not a pre-release, passes the newest pre-release (a `bN` tag) when it is newer than that (`--beta`), and runs `site/build.py --strict`. A failed build leaves the last deployment up |
+| Branches | Production branch `main`; every other branch of this repository builds a preview |
+| Variables | `PYTHON_VERSION` `3.12` (both environments). `RFOUNDRY_SENTRY_DSN` in production only, so previews send no error reports. `GITHUB_TOKEN` (encrypted, both environments): a fine-grained token with read-only access to public repositories. Without it the release lookup shares the builders' 60 requests an hour, and a build can fail with 403 "rate limit exceeded" after a minute of retries |
+| Custom domain | `radiofoundry.org` on the project (Custom domains). The `www` name redirects to it |
+| Release rebuild | The project's deploy hook, as `CLOUDFLARE_DEPLOY_HOOK` in the `site` environment (main and release tags only), which `site.yml` calls |
+| Analytics | Cloudflare Web Analytics, turned on in the project's Metrics tab. Pages adds the beacon to each deployment; it sets no cookies |
+| 404 | Pages serves the build's `404.html` for a missing page |
+| Roll back | The project's Deployments list: Rollback on an earlier production deployment |
+
+## Sources
+
+Nothing on the site is copied by hand. Each page reads its source at build time:
+
+| Shows | Comes from |
+|---|---|
+| Radios, their order and status | The board registry, `boards/<radio>/board.toml` (`tools/boards.py json --for site`). `order` sorts them; the lowest is the home page's radio |
+| Planned radios | The rows of the [radio survey](../spec/radios.md) "Summary table" that name no board, by their Port cell (`tools/registry_docs.py`): `Planned`, `Planned, hardware needed`, `In progress, #N` (badge "In progress", linked to the pull request) or `Not planned` (not listed), each with an optional `. note` |
+| A radio's cards | One card per board, then one per `looks` entry of its board.toml (another body the board ships in), each with its own drawing and the radios in that body; a look's card links to the board's page. The board's card lists the radios not moved to a look |
+| A radio's one-line note for visitors | board.toml `[status] summary`, the same line the README and the user manual show; a catalog may translate it as `radio.note.<radio>`. A planned radio's: the note of its Port cell, which a catalog may translate as `planned.note.<slug of the survey name>` |
+| A radio's name, bands, processor, screen, bootloader steps, flash backend, codeplug location | board.toml, the CPU from `platform/<p>/platform.toml`, the backend from the `[flash] family`, the codeplug location from the board's `hal_flash_map_t` |
+| A radio's status badge (Supported, In development) | board.toml `[status] level`: `supported` reads Supported, `testing` and `bring-up` read In development |
+| Which features a radio has, per variant | `make BOARD=<radio> [VARIANT=<v>] print-config` and `print-required`; what it can't have is config.mk `BOARD_UNSUPPORTED` (shown ✕) and what isn't written for it yet `BOARD_NOT_WRITTEN` (shown …), with their reasons, through the registry |
+| Feature names, help, dependencies | `config/features.mk` (the comment above each switch, the `needs` checks) |
+| Feature groups, titles, flash cost, notes | The tables in [feature-matrix.md](../feature-matrix.md) |
+| Variants and why each leaves a feature out | `config/variants/<id>.mk` ([build-config.md](../build-config.md)) |
+| Screenshots | `docs/ux/screens/<gallery>/` (`make -C tests/host ui-gallery`), six per radio page in two rows of three: the first of `featured` in `site/data/screens.json` the radio has. The Screenshots page (`/screenshots/`) shows every screen each radio's build has, a section per board, under the `groups` headings of `screens.json`, in its order. The home page's carousel lists its screens in `site/templates/home.html`, from every gallery, one height. Every page shows the scaled copies ([Screenshot copies](#screenshot-copies)) |
+| Flash layout, codec profiles, stock files, key hashes | The board registry (`tools/rfoundry/rfoundry/registry.json`, read through `boards.py`) and `stockfw.py`, exported to `data/flash-boards.json` |
+| Documentation | Every Markdown file under `docs/` |
+| Firmware images | Release manifests and images (`--firmware`; the workflow downloads the newest release) |
+
+The build fails when a source doesn't parse, and warns (an error with `--strict`) when a feature has no row in the
+feature matrix, a screen isn't in `screens.json` or names a group it doesn't list, a string is missing from the English
+catalog (a screen's caption included), the Screenshots page lacks a board or a screen that board's build has, or a page
+links to a file the build didn't write.
+
+`data/*.json` is what the pages read and doubles as a public API for other tools: `radios.json`, `features.json`,
+`variants.json`, `flash-boards.json`, `screens.json`, `releases.json`, `site.json`.
+
+## The Screenshots page
+
+`/screenshots/` has a section per board, from the registry in its order, and a link per board at the top. Each section
+shows every shot in the board's gallery whose `screens.json` entry needs only switches the board's full build has (the
+radio page's six use the same test). A board's screens are one width: a gallery 160 pixels wide or less at twice its
+size, a wider one as it is. A color page's shots in other highlight colors and themes
+(`<page>__<color>`) follow the page, hidden until the visitor ticks "Also show other highlight colors and themes" (CSS
+`:has()`, no script). `site.js` switches sections without reloading and keeps the address `#<radio>`, so a link can
+name a radio (each radio page links to its own). Without the script, CSS shows the section the address names
+(`:target`), else the first.
+
+Nothing on the page names a screen, a group or a radio:
+
+| To add | Touch |
+|---|---|
+| A screen | `tests/host/uiSim.c` (`gallery[]`) and `make -C tests/host ui-gallery`; its entry in `site/data/screens.json` (group, needs); its caption `screen.<name>` in `site/i18n/en.json` |
+| A group | `groups` in `screens.json` and its heading `screens.group.<group>` in `en.json` |
+| A radio | `boards/<radio>/` as [Adding a radio](adding-a-radio.md) says; `board.toml` `hardware.gallery` must name a display class the gallery has (`tools/boards.py check`) |
+
+## Screenshot copies
+
+The gallery holds each screen at its panel's size. The pages draw screens larger, at sizes that are rarely a whole
+multiple of it, on displays whose device pixel ratio may be fractional (125 %, 150 %). Nearest-neighbor scaling
+(`image-rendering: pixelated`) then makes some pixel rows wider than others, and a browser that ignores the property
+blurs them. So `site/rfoundrysite/shots.py` writes a copy of every gallery screen, `static/img/screens/<gallery>/`,
+scaled up a whole number of times with hard pixel edges, and the browser scales it down smoothly: every pixel keeps
+one width, at any size.
+
+| What sets it | How |
+|---|---|
+| The factor, per gallery | `ceil(2 × largest CSS width a page draws it at ÷ its width)`: enough for a device pixel ratio of 2 |
+| The widths | Each page reports where it draws a screen. The CSS sizes come from `site.css` (`--shot-h` of `.carousel`, `--shot-col` of `.shots`, the `max-width` of `.device-frame` and `.rt-pic`, the heights of `.hero-device img` and `.radio-card img`), the drawings' screen position from `frame_geometry` |
+| The drawings | `<radio>.svg` and a look's drawing embed the boot screen's copy |
+
+The build fails when one of those rules is gone from `site.css`. The copies carry no `image-rendering`. The docs
+pages still link the gallery's own files, shown with `image-rendering: pixelated`. A higher pixel ratio than 2 scales
+a copy up a little, smoothly. `site/tests/shots_test.py` checks the scaling.
+
+## Layout
+
+| Path | What |
+|---|---|
+| `site/build.py` | Entry point |
+| `site/rfoundrysite/repo.py` | Reads the sources above |
+| `site/rfoundrysite/build.py` | Assembles the pages and data files |
+| `site/rfoundrysite/docs.py` | `docs/` to HTML: GitHub heading ids, `.md` links to `.html`, links out of `docs/` to the repository |
+| `site/rfoundrysite/device.py` | Radio images: frame, overlay geometry, boot screen composite |
+| `site/rfoundrysite/shots.py` | The gallery screens' scaled copies ([Screenshot copies](#screenshot-copies)) |
+| `site/rfoundrysite/toolzip.py` | `downloads/rfoundry-tool.zip`: rfoundry from the site's commit for the flasher's manual install kit, with a launcher; `data/site.json` `tool` gives its path, size and SHA-256 ([web-flasher.md](web-flasher.md#the-manual-install-kit)). `site/tests/toolzip_test.py` runs it unpacked |
+| `site/rfoundrysite/social.py` | The link preview image (`static/img/social.png`, every page's `og:image`): each radio with a different screen, rasterized with resvg |
+| `site/rfoundrysite/tmpl.py`, `site/templates/` | Page markup (below) |
+| `site/i18n/` | String catalogs (below) |
+| `site/static/css/tokens.css`, `site.css` | Design tokens, then layout and components |
+| `site/static/js/site.js` | Theme toggle, menu, features filter, screen overlay on radio pages, the home page's screenshot carousel, the Screenshots page's radio links |
+| `site/static/js/flasher/` | The web flasher (below) |
+| `site/static/js/codeplug/` | Codeplug decoding and encoding, CSV, the radio transport, contacts sources ([codeplug-editor.md](codeplug-editor.md)) |
+| `site/static/js/editor/` | The Codeplug Editor page |
+| `site/rfoundrysite/radioid_regions.py` | Writes `codeplug/sources/regions.js` from a RadioID.net `user.csv` (country and state names only) |
+| `site/static/js/tools.js` | The Tools page (codeplug conversion) |
+| `site/static/img/radios/src/<radio>.svg` | Radio illustrations (below) |
+| `site/tests/` | Flasher and editor tests: `fixtures.py` makes inputs with rfoundry, the HR_C7000 tools and `tests/host/cpsSim`; the `*.test.mjs` files check the JavaScript |
+
+## Templates and design
+
+Markup lives in `site/templates/*.html` and `partials/`, with four kinds of placeholder: `{{ value }}` (escaped),
+`{{{ html }}}` (as built), `{{t key}}` (a translated string) and `{{> partial }}`. `{{root}}` is the path to the site
+root (static files, data) and `{{home}}` the path to the root of the page's language (links between pages). Loops
+stay in Python, which renders a partial per item.
+
+Every page's footer has two help cards: the community group (`COMMUNITY_URL` in `site/rfoundrysite/build.py`, also
+`community` in `data/site.json`) and the GitHub issues. The web tools' report line under an error (`reportLine()` in
+`static/js/report.js`) links the same two. Their icons are CSS masks (`.icon-*` in `site.css`), drawn in the text
+color.
+
+Every page's footer ends with a faint build stamp: the firmware release the flasher installs (linked to its GitHub
+release; left out before the first release), a Changelog link to the GitHub releases, the commit the site was built from
+(`-dirty` with uncommitted changes, linked to the commit) and the build time in UTC. `data/site.json` has the same
+commit and the date, the release (`release`) and the pre-release offered (`beta`, below).
+
+All visual decisions are variables in `tokens.css`: colors for light and dark, type sizes, spacing, radii.
+`site.css` only uses them. A redesign replaces `tokens.css`, then `site.css` and the templates; the generator doesn't
+change. Readability comes first ([principles](../ux/principles.md)): 18 px base type, high contrast, nothing
+squeezed.
+
+## Glossary
+
+`docs/glossary.json` is the one source. `python3 tools/glossary.py --write` generates the two glossary pages from it:
+[user/22-glossary.md](../user/22-glossary.md) (entries with scope `user`) and [glossary.md](glossary.md) (scope `dev`).
+Never edit those pages by hand. `tools/ci.sh` fails when they are stale.
+
+| Field | Meaning |
+|---|---|
+| `term` | The name as the page shows it. A plain word (lowercase, or one capital) also matches in any case and with a plural `s`. An acronym or mixed-case name matches exactly. |
+| `aliases` | Other spellings and plurals. Each follows the same matching rule. |
+| `category` | One of `categories` in the file. It is the page's section. |
+| `scope` | `user`: listed in the user glossary, previewed in the whole site. `dev`: listed in the developer glossary, previewed outside the user guide. |
+| `definition` | One or two short sentences. Say what the standard calls it when a vendor uses another name. |
+| `link` | Optional path under `docs/` of the section that explains it. The preview's "More" link goes there, else to the glossary row. |
+| `preview` | `false` keeps a common word (Monitor, Zone) in the glossary but never marks it in the text. |
+
+The site build (`docs.py`) wraps a term in `<abbr class="gl" title="...">` at build time. The Markdown stays unmarked, so GitHub
+shows plain text. Rules:
+
+- Whole words only. Not inside code, headings, link text, a table's first column, hyphenated words or paths.
+- The first use in each section (a section ends at the next `#` or `##` heading).
+- `<!-- glossary: off -->` in a page turns marking off for that page. `<!-- glossary: off TG, SFR -->` turns off those terms.
+
+`site.js` turns each `<abbr>` into a popover on hover, keyboard focus and tap, with a "More" link (Enter follows it from the
+keyboard). Without JavaScript the `title` shows the definition. `site/tests/glossary_test.py` tests the rules.
+
+To add a term, add an entry to the file, run `python3 tools/glossary.py --write` and `python3 tools/glossary.py --check`.
+`python3 tools/glossary.py --unexplained` lists all-capital words the docs use that have no entry (pin names and
+identifiers with digits or underscores are skipped). Add an entry for each one that matters to a reader, or its name to `excluded`.
+
+## Translating
+
+How to add a language, radio and site: [translating.md](translating.md). `site/i18n/languages.json` lists the languages. The default (English) is at the site root, others under `/<code>/`.
+The header's language menu (`details.lang-switch`) links the page in every language. On a first visit, when the browser's first language the site has isn't the page's, a bar under the header offers it, in that language (`static/js/langhint.js`; the words come from each catalog's `nav.lang_*` keys). It never redirects. Picking a language or dismissing the bar is remembered (`localStorage` `rfoundry-lang`).
+Each language has a flat catalog `site/i18n/<code>.json`; a missing key falls back to English, key by key. The
+flasher, the Codeplug Editor and the Tools page get their strings from the same catalog, embedded in the page
+(`<script id="i18n">`, read by `static/js/i18n.js`). Text that comes from the repository (feature help, variant
+reasons) is English at its source; a catalog can override it with `feature.<SWITCH>.title`, `feature.<SWITCH>.help`,
+`variant.<id>.title`, `variant.<id>.summary` or `group.<slug>`.
+
+| `languages.json` field | Meaning |
+|---|---|
+| `code` | The URL prefix and `<html lang>`: `es`, `pt-BR` |
+| `name` | The language's name in itself (`Español`): the switcher's label |
+| `dir` | `ltr` or `rtl`: `<html dir>` |
+| `locale` | `og:locale` for link previews (`es-ES`); the code when left out |
+
+With more than one language, every page gets a language switcher in the header (a link to the same page in each
+language), `<link rel="alternate" hreflang>` for each language plus `x-default`, and its own `404.html` in each
+language's tree. Links between pages use `{{home}}` (templates) or `HOME` (`flasher/dom.js`), so they stay in the
+visitor's language. With one language there is no switcher and no alternate links.
+
+A translated documentation page goes in `docs/i18n/<code>/<path under docs>`. Pages without one are shown in
+English with a notice, the text marked `lang="en"`.
+
+### Plurals, numbers and dates
+
+| Need | How |
+|---|---|
+| A count in the text | Plural forms: `key.one`, `key.other` (and `key.zero`, `key.two`, `key.few`, `key.many` where the language has them). Pass the count as the number `n`: `t("key", { n: 3 })`, `self.t(lang, "key", n=3)` |
+| Which form | The scripts: `Intl.PluralRules` of the page's language. The generator: `PLURAL_RULES` in `site/rfoundrysite/i18n.py`; a language whose rule differs from English's gets an entry there |
+| A language's forms | It uses its own forms when its catalog has the family (`key.other`), never a mix with English's |
+| Numbers | `n` is written in the page's language (`1,200`, `1.200`). Any other number: `num(x)` from `flasher/dom.js`, with `Intl.NumberFormat` options for decimals |
+| Dates | `date(d, options)` and `localTime(iso)` from `flasher/dom.js`: the page's language, the visitor's time zone |
+
+To give an English string plural forms, replace its key with `key.one` and `key.other` in `en.json`, then the
+translations.
+
+### The check
+
+Every build checks the catalogs (`i18n.check()` in `site/rfoundrysite/i18n.py`) and warns, an error with `--strict`:
+
+- each file is valid JSON with no key twice;
+- `languages.json` names its default among the languages, each with a code, a name and `ltr` or `rtl`;
+- a catalog other than English has only keys `en.json` has. A plural form counts when `en.json` has the family;
+- each string keeps the English placeholders (`{name}`, `{{...}}`) and HTML tags. A plural form other than `other`
+  may leave `{n}` out ("one file").
+
+`python3 -m rfoundrysite.i18n` (from `site/`) runs the check alone, and also fails on a key a language lacks
+(`i18n.missing()`): the site works without it, but a pull request leaves none ([translating.md](translating.md)). `site/tests/i18n_test.py` tests the check and
+builds the site with a made-up second language: pages under `/es/`, the switcher, alternate links, English where the
+catalog has no string. `site/tests/i18n.test.mjs` tests the scripts' side. `tools/ci.sh` runs both.
+
+### Adding a language
+
+1. Copy `en.json` to `<code>.json` and translate. Leave a string out rather than copy it: English fills in.
+2. Add the language to `languages.json`.
+3. If its plural rule differs from English's, add it to `PLURAL_RULES` in `site/rfoundrysite/i18n.py`.
+4. Build and look: `python3 site/build.py --serve`, then `http://localhost:8000/<code>/`. `--strict` shows any
+   catalog problem.
+
+### What stays English
+
+| Text | Why |
+|---|---|
+| Radio facts from `board.toml`: bootloader key steps, build options, notices, bands, variant checks | Repository data, one per radio. A catalog can translate a radio's summary (`radio.note.<radio>`) |
+| A variant's reason for leaving a feature out (`config/variants/*.mk`) | Repository data |
+| Error messages from the protocol modules (`stub.js`, `dfu.js`, `link.js`, ...) shown after a translated explanation | The exact words for the technical details and the bug report. The page maps the common ones to catalog strings (`errorText` in `flasher/app.js`) |
+| The flasher's log box and diagnostic notes | Technical log, read with a bug report |
+| `README.txt` of the manual install kit and of a backup bundle | Files that go with the tool, like the documentation |
+| Glossary definitions | `docs/glossary.json`, part of the documentation |
+
+## Radio images
+
+Each radio has an original illustration, `site/static/img/radios/src/<radio>.svg`, drawn from straight-on reference
+photos (the photos stay outside the repository: product photos are not ours to publish). Rules:
+
+- viewBox `0 0 W H`, transparent background, no external references or embedded images;
+- exactly one `<rect id="screen" x y width height/>`, black, transform-free and not covered by anything, on the
+  display's visible area, with the aspect ratio of the radio's gallery (5:4 for 160x128 and 160x120i5, 22:31 for
+  240x320i10x5);
+- for the radio's web control page (`docs/spec/tcp-services.md` 5.1): each key it shows carries `id="key-<name>"`, the
+  name being the board's `KEY_*` in lower case without `KEY_` (`key-fn_left`); the channel knob `id="encoder"` and a
+  drawn LED `id="led"`. Keys whose shape doesn't match a key (a d-pad drawn as one piece) get transparent hit rects
+  (`fill="none" pointer-events="all"`) at the end. A key off the front face (side keys, top keys) also carries
+  `data-edge="left|right|top|bottom"`, the drawing's edge it is on: the page puts a labeled button for it outside
+  that edge. Every key of the radio is tagged, or named in `data-undrawn="name ..."` on the `<svg>` element when the
+  drawing doesn't show it (a front view without the side keys); the page makes those buttons;
+- `tools/svg_keys.py check` checks the tags: each `key-` id names one of the radio's keys, once, and no key is
+  missing. The site build runs the same check, so a drawing that lost its tags fails CI. After drawing or redrawing a
+  radio, `tools/svg_keys.py tag <radio>` adds the tags: by the labels in the drawing ("MENU", "1", "*"), then by the
+  last tagged version in git, mapped onto the new drawing (edges, the LED, the knob and hit rects come along). It
+  prints each tag and what it couldn't place. Check the result on the web control page before committing. A key's
+  shape has no transform, its own or a group's: the build reads its box from its attributes (below), and the check
+  fails one it can't read;
+- a radio with a keyed hand microphone may have `<radio>-mic.svg` beside its drawing, for the web control page only:
+  the same `key-` rule, the ids counted once across both files, and gradient ids of its own (the page puts both
+  drawings in one document).
+
+A look (board.toml `looks`) has its drawing in `<radio>-<look id>.svg` beside the board's, under the same rules and
+with the same keys. The build writes its frame and boot-screen files like the board's, and fails when the drawing is
+missing.
+
+The build writes `static/img/radios/<radio>-frame.svg` (screen black), `<radio>.svg` (with the boot screen) and the
+screen's position in `data/radios.json` (`frame_geometry`: viewBox units and percentages), so any screenshot can be
+laid over the frame; the radio pages do that when a screenshot is clicked. `frame_geometry.keys` has each tagged key's
+box, as percentages of the picture. A radio without an illustration gets a generic drawing from board.toml `[frame]`;
+its handheld shapes tag their side PTT, and the caption names any other key.
+
+The web flasher shows the same frame (`frame_image`) beside every update mode step, for every radio
+(`flasher/radiotop.js`): the bootloader entry steps as the picture alone, the HR_C7000 steps with what the screen shows
+laid over it at `frame_geometry` and an LED swatch that blinks as the real LED does, with a caption in words. Nothing
+in the flasher names a radio: a new board's picture appears with no flasher change. `site/tests/radio_images_test.py`
+(run by `site/tests/run.sh`) renders every board's picture and fails a board without a usable one.
+
+On the bootloader entry steps (the STM32 radios' and the HR_C7000 update mode's), the flasher rings the keys to hold
+on the picture and names them under it ("Hold PTT and SK1"). The keys are `[flash.bootloader] hold` in board.toml,
+by key name, carried to the flasher as `flash.bootloader_hold`; the rings sit at `frame_geometry.keys`, and the labels
+are `flash.key.<name>` in the string catalog (a key without one reads as its name in capitals). The rings are
+decoration: the steps stay the instructions, and a key the picture doesn't show (in `data-undrawn`) is named in the
+caption only. `radio_images_test.py` checks every board: each key to hold is a key of the radio, tagged in its drawing
+and each look's or listed undrawn, with a label; `site/tests/radiotop.test.mjs` checks the marks and the caption.
+
+## Flasher notices
+
+Two notices show on every step of the web flasher once a radio is picked, above the step:
+
+| Notice | Shown when | Text from |
+|---|---|---|
+| Pre-release | The radio's `[status] level` is below `supported`. Says the build is in development, that not every feature may work or has been tried on a radio, and links to the project's GitHub issues to report a bug | The `flash.prerelease.*` strings of `site/i18n/<code>.json` |
+| Board | The board sets `[flash] notice`: a warning for a choice the radio can't check itself | board.toml ([board-registry.md](board-registry.md)) |
+
+One more shows on the start page and the first install step: **Beta**, when `site.json` names a pre-release newer
+than the release (`--beta`, from `site/cloudflare-build.sh`). It links to the same page with `?version=<beta>`, so the
+user opts in through a version link and the build service builds the tag; the default install stays the release. It is
+hidden while a version link is in use. Text: the `flash.beta.*` strings.
+
+## Error logging and bug reports
+
+The flasher and the Codeplug Editor log what they do in memory (`static/js/diag.js`). Neither keeps the log after
+the page closes.
+
+| Entry | Holds |
+|---|---|
+| Note | A step: the radio found and its firmware, a write plan's size, a flasher step, each line of the flasher's log box |
+| Wire | One line per debug link or CPS frame (`link.js`): command, address, length, result. Never the data |
+| Error | Every error shown to the user, once, with the stage it happened in, its code and params, stack and causes |
+
+Every error also goes to the browser console (`[rfoundry] <stage> failed:`). Failure messages carry **Report a Problem**
+(`static/js/report.js`). It downloads a zip with `report.json` (the log, the browser, the tool's state) and, if the
+user ticks them, the edited codeplug and the one last read from the radio.
+
+Automatic error reports go to Sentry when the build has `RFOUNDRY_SENTRY_DSN` set (a production variable of the
+Pages project; `site.json` `reports.sentry_dsn`). Without it nothing is sent and the privacy
+note is left off the pages. With it:
+
+| Sent | When |
+|---|---|
+| The error, its stage, code and params, the tool's state (radio model, firmware version, task; no codeplug contents), the last 20 notes and errors of the log (`diag.trail()`, one line each cut to 300 characters; no wire lines, no shown messages, USB serial numbers masked), and an unknown file's type, size and first 8 bytes (never its name) | Every error except ones the user caused (port chooser closed, Stop) |
+| The whole report and any codeplug the user checked | Only when the user clicks Send Report |
+
+Automatic reports go through `diag.scrub()`, which removes callsigns, DMR IDs and email addresses. The Sentry bundle
+is pinned with an SRI hash in `report.js`. It loads without breadcrumbs or other default integrations, so it sends only
+what `diag.error` hands it. `?reporting=0` turns sending off, as it does for the flash log. Ad blockers often block
+Sentry; the page then works the same and offers the download only.

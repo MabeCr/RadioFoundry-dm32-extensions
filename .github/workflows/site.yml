@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 The RadioFoundry Authors
+#
+# The web site (docs/dev/website.md) is built and deployed by Cloudflare Pages on each push to main
+# (site/cloudflare-build.sh). This workflow only covers what a push doesn't: a published release changes the flasher's
+# firmware images, so it asks Pages to build main again through the project's deploy hook. Run by hand, it does the
+# same.
+#
+# Needs the site environment's CLOUDFLARE_DEPLOY_HOOK secret.
+name: Web site
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rebuild:
+    # the hook URL is a secret: GitHub's runners only. The site environment hands it only to main and release tags
+    runs-on: ubuntu-24.04
+    environment: site
+    steps:
+      - name: Ask Pages to build main
+        env:
+          HOOK: ${{ secrets.CLOUDFLARE_DEPLOY_HOOK }}
+        run: curl -fsS -X POST "$HOOK" > /dev/null && echo "Pages build of main requested"

@@ -1,0 +1,1199 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 The RadioFoundry Authors
+"""md380_migrate: move a TYT MD-380 / MD-390 / Retevis RT3 from stock or md380tools (KD4Z toolkit) firmware to
+RadioFoundry, keeping the channels, zones, contacts, RX group lists and the DMR ID (callsign) database.
+
+    md380_migrate.py all --image rfoundry_md380_codec.bin --stock "MD-380-D2.32(AD).bin"     the whole migration
+    md380_migrate.py all --image rfoundry_md380_codec.bin --key md380.key --from my.rdt      codeplug from a CPS file
+    md380_migrate.py backup [--from FILE]       read the codeplug from the stock radio (or convert a file) and check it
+    md380_migrate.py flash --image FILE ...     flash RadioFoundry (or any TYT updater file) through the TYT bootloader
+    md380_migrate.py restore --workdir DIR      write the converted codeplug and the ID database to the radio on RadioFoundry
+    md380_migrate.py package OUTDIR --image FILE   a directory to hand to a tester
+    md380_migrate.py --self-test                the pure conversion logic, no radio, no dmrconf
+
+Every command takes --dry-run: offline steps (file conversion, image checks) run, nothing touches the radio.
+
+The codeplug conversion is done by qdmr's command line tool dmrconf (an external program, installed separately):
+the stock codeplug is read with dmrconf's TyT MD-390 driver (the MD-380, MD-390 and RT3 share one codeplug format),
+turned into qdmr's radio-independent YAML, cleaned of RX group lists RadioFoundry doesn't need, encoded with the driver for
+qdmr's open firmware family (OpenUV380), which is the layout RadioFoundry's CPS compatibility layer serves, and written through
+that layer with cps_client.py. The codeplug steps are shared with the other radios' migration tools
+(codeplug_port.py, docs/spec/codeplug-port.md). docs/spec/md380-migration.md has the details,
+docs/user/18-moving-from-stock-md380.md the user guide.
+
+Needs Python 3.8+, dmrconf (qdmr 0.12 or newer) on PATH, pyusb with libusb (flashing) and pyserial (talking to the
+radio once it runs RadioFoundry). The flash and debug link helpers (stm32_dfu.py, rfoundry_debug.py), codeplug_port.py and
+cps_client.py are loaded from this script's directory, and the rfoundry package from rfoundry/ beside it, as in a kit.
+"""
+import argparse
+import csv
+import datetime
+import hashlib
+import importlib.util
+import io
+import json
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import codeplug_port as cp  # noqa: E402  (next to this script)
+
+# TYT MD-380 / MD-390 CPS codeplug file (.rdt): a 549-byte header, the 256 KB codeplug image, a 16-byte trailer. The
+# sizes are the published ones (the TYT CPS and the md380tools documentation); dmrconf's manufacturer reader for
+# the md390 checks the total size (262709 bytes)
+CODEPLUG_SIZE = 0x40000
+RDT_HEADER = 549
+RDT_TRAILER = 16
+RDT_SIZE = RDT_HEADER + CODEPLUG_SIZE + RDT_TRAILER
+
+STOCK_DRIVER = "md390"        # dmrconf --radio for the stock codeplug (MD-380, MD-390, RT3)
+RFOUNDRY_DRIVER = "openuv380"      # dmrconf --radio for RadioFoundry (open-firmware-cps.md 4: radio type 7, OpenUV380 family)
+
+# What RadioFoundry's codeplug layout holds, and the qdmr YAML helpers: shared (codeplug_port.py)
+RFOUNDRY_LIMITS = cp.RFOUNDRY_LIMITS
+SECTION_NAMES = cp.SECTION_NAMES
+
+APP_BASE = 0x0800C000
+FLASH_END = 0x08100000
+CODEC_SIG = 0x4FF0E92D
+CODEC_SIG_ADDR = 0x080E0000   # first word of the D002.032 codec code where the merge puts it (codec-placement.md)
+CONTAINER_MAGIC = b"OutSecurityBin"
+CONTAINER_HEADER = 0x100
+MD380_KEY_SHA256 = "5254139c6b596d9413d106e6b7c0685ec245d69555cb28df98f061d6b879c4cd"
+
+
+MigrateError = cp.PortError     # one error type for this tool and the shared codeplug steps
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# pure logic (covered by --self-test)
+
+def classify_codeplug(data, name=""):
+    """What a codeplug file is: 'rdt' (TYT CPS / KD4Z toolkit), 'raw' (a 256 KB image, as md380tools dumps it),
+    'dfu' (dmrconf's binary format), 'yaml' (qdmr). Raises MigrateError for anything else."""
+    low = name.lower()
+    if data.startswith(b"DfuSe"):
+        return "dfu"
+    if len(data) == RDT_SIZE:
+        return "rdt"
+    if len(data) == CODEPLUG_SIZE:
+        return "raw"
+    if low.endswith((".yaml", ".yml")) or data.lstrip()[:8] in (b"version:", b"---\nvers"):
+        return "yaml"
+    if len(data) >= 0x100000:
+        raise MigrateError("%s is %d bytes: that looks like a whole SPI flash or firmware dump, not a codeplug. Save "
+                           "the codeplug with the TYT CPS (.rdt) or read it from the radio instead" % (name, len(data)))
+    raise MigrateError("%s: %d bytes is neither a TYT .rdt codeplug (%d bytes), a raw 256 KB codeplug image (%d bytes), "
+                       "a dmrconf .dfu file nor qdmr YAML" % (name, len(data), RDT_SIZE, CODEPLUG_SIZE))
+
+
+def raw_to_rdt(raw):
+    """Wrap a raw 256 KB codeplug image in the .rdt frame dmrconf's manufacturer reader takes. The header and trailer
+    are zero: dmrconf reads only the image (a file for qdmr, not for the TYT CPS)."""
+    if len(raw) != CODEPLUG_SIZE:
+        raise MigrateError("a raw codeplug image is %d bytes, not %d" % (CODEPLUG_SIZE, len(raw)))
+    return bytes(RDT_HEADER) + raw + bytes(RDT_TRAILER)
+
+
+yaml_sections = cp.yaml_sections
+item_field = cp.item_field
+codeplug_summary = cp.codeplug_summary
+limit_report = cp.limit_report
+compare_counts = cp.compare_counts
+print_summary = cp.print_summary
+
+
+USER_FIELDS = {
+    "id": ("radio_id", "radioid", "id", "dmr_id", "dmrid", "dmr id", "radio id", "radio_id"),
+    "callsign": ("callsign", "call", "call_sign", "call sign"),
+    "fname": ("first_name", "fname", "firstname", "first name", "name"),
+    "surname": ("last_name", "surname", "lastname", "last name"),
+    "city": ("city",),
+    "state": ("state", "province"),
+    "country": ("country",),
+}
+# Columns of a users file without a header row. Override with --users-columns when your file differs: the tool shows
+# the first records before it uses them
+DEFAULT_USER_COLUMNS = ("id", "callsign", "fname", "surname", "city", "state", "country")
+
+
+def parse_users_csv(text, columns=None):
+    """DMR users from a CSV (radioid.net's user.csv, or the users file of md380tools / the KD4Z toolkit). A header row
+    is recognized by its column names; otherwise `columns` (default DEFAULT_USER_COLUMNS) names them. Lines whose
+    first field is not a DMR ID (a size line, comments, blanks) are skipped. Returns a list sorted by ID, one entry per
+    ID (the first one wins)."""
+    rows = list(csv.reader(io.StringIO(text)))
+    names = None
+    if rows and not (rows[0] and rows[0][0].strip().isdigit()):
+        head = [c.strip().lower() for c in rows[0]]
+        mapped = []
+        for c in head:
+            mapped.append(next((f for f, aliases in USER_FIELDS.items() if c in aliases), None))
+        if "id" in mapped and "callsign" in mapped:
+            names = mapped
+            rows = rows[1:]
+    if names is None:
+        names = list(columns or DEFAULT_USER_COLUMNS)
+    seen, users = set(), []
+    for r in rows:
+        if len(r) < 2:
+            continue
+        rec = {}
+        for i, f in enumerate(names):
+            if f and i < len(r):
+                rec[f] = r[i].strip()
+        rid = rec.get("id", "")
+        if not rid.isdigit() or not rec.get("callsign"):
+            continue
+        rid = int(rid)
+        if not 1 <= rid <= 0xFFFFFF or rid in seen:
+            continue
+        seen.add(rid)
+        u = {"id": rid, "callsign": rec["callsign"].upper()}
+        for f in ("fname", "surname", "city", "state", "country"):
+            if rec.get(f):
+                u[f] = rec[f]
+        users.append(u)
+    users.sort(key=lambda u: u["id"])
+    return users
+
+
+def users_json(users):
+    """The custom user database for `dmrconf write-db --database`: {"users": [{"id", "callsign", "fname", "surname",
+    "city", "state", "country"}]}. Checked with dmrconf 0.15.1 encode-db (records 'CALL Name City State Country')."""
+    return json.dumps({"users": users}, ensure_ascii=False, indent=0) + "\n"
+
+
+def classify_image(data):
+    """('container', [(addr, len)]) for a TYT updater file, ('plain', has_codec) for a RadioFoundry application image."""
+    if data.startswith(CONTAINER_MAGIC):
+        if len(data) < CONTAINER_HEADER + 8:
+            raise MigrateError("truncated TYT updater file")
+        count = struct.unpack_from("<I", data, 0x7C)[0]
+        if count == 0xFFFFFFFF:
+            count = 1
+        if not 1 <= count <= 15:
+            raise MigrateError("TYT updater file: implausible segment count %d" % count)
+        segs = [struct.unpack_from("<II", data, 0x80 + 8 * i) for i in range(count)]
+        return "container", segs
+    if data.startswith(b"\x7fELF"):
+        raise MigrateError("this is an ELF file: use the .bin")
+    if not data or APP_BASE + len(data) > FLASH_END:
+        raise MigrateError("image size %d does not fit 0x%08X..0x%08X" % (len(data), APP_BASE, FLASH_END))
+    off = CODEC_SIG_ADDR - APP_BASE
+    has_codec = len(data) >= off + 4 and struct.unpack_from("<I", data, off)[0] == CODEC_SIG
+    return "plain", has_codec
+
+
+def container_stream(data, segs):
+    """The encrypted stream the bootloader takes, straight out of a TYT updater file. The file's payload is XORed with
+    the key indexed from the payload start, and the bootloader stream with the key indexed from 0x0800C000
+    (hardware-md380.md 14.2-14.3), so when the segments start at 0x0800C000 and are contiguous the payload is sent as
+    it is, without the key."""
+    if segs[0][0] != APP_BASE:
+        raise MigrateError("the updater file starts at 0x%08X, not 0x%08X: not an MD-380 application file"
+                           % (segs[0][0], APP_BASE))
+    addr = APP_BASE
+    for a, n in segs:
+        if a != addr:
+            raise MigrateError("the updater file's segments are not contiguous (0x%08X after 0x%08X)" % (a, addr))
+        addr += n
+    if addr > FLASH_END:
+        raise MigrateError("the updater file runs past the end of flash")
+    total = addr - APP_BASE
+    if CONTAINER_HEADER + total > len(data):
+        raise MigrateError("the updater file is shorter than its segment table says")
+    return data[CONTAINER_HEADER:CONTAINER_HEADER + total]
+
+
+def xor_key(data, key):
+    reps = (len(data) + len(key) - 1) // len(key)
+    return bytes(a ^ b for a, b in zip(data, (key * reps)[:len(data)]))
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# helpers: modules, messages, external programs
+
+def load_module(name, candidates):
+    for rel in candidates:
+        path = os.path.join(HERE, rel)
+        if os.path.isfile(path):
+            spec = importlib.util.spec_from_file_location("md380mig_" + name, path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+    raise MigrateError("%s.py not found next to this script (looked in: %s)" % (name, ", ".join(candidates)))
+
+
+def stm32_dfu():
+    return load_module("stm32_dfu", ["stm32_dfu.py"])
+
+
+def stockfw():
+    sys.path.insert(0, os.path.join(HERE, "rfoundry"))
+    from rfoundry import stockfw as sfw  # a module of the package, as in stm32_dfu.py: it imports codecmap relatively
+    return sfw
+
+
+def rfoundry_debug_path():
+    p = os.path.join(HERE, "rfoundry_debug.py")
+    if not os.path.isfile(p):
+        raise MigrateError("rfoundry_debug.py not found next to this script")
+    return p
+
+
+def sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+class Session:
+    """Messages, prompts, the dry-run switch, a log in the work directory and the state file."""
+
+    def __init__(self, args):
+        self.dry = args.dry_run
+        self.yes = args.yes
+        self.port = full_port(getattr(args, "port", None))
+        self.dmrconf = getattr(args, "dmrconf", None) or shutil.which("dmrconf") or "dmrconf"
+        self.workdir = None
+        self.cache = {}
+        self.log = None
+        self.state = {}
+        self.platform = sys.platform
+
+    def open_workdir(self, path=None, create=True):
+        if path is None:
+            stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            path = os.path.join(os.path.expanduser("~"), "RadioFoundry-MD380-migration", stamp)
+        path = os.path.abspath(os.path.expanduser(path))
+        if create:
+            os.makedirs(path, exist_ok=True)
+        elif not os.path.isdir(path):
+            raise MigrateError("work directory %s does not exist" % path)
+        self.workdir = path
+        self.log = open(os.path.join(path, "migration.log"), "a", encoding="utf-8")
+        self.state = self.load_state()
+        self.say("work directory: %s (nothing in it is ever deleted)" % path)
+
+    def path(self, name):
+        return os.path.join(self.workdir, name)
+
+    def load_state(self):
+        try:
+            with open(self.path("state.json"), encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+
+    def save_state(self, **kv):
+        self.state.update(kv)
+        if self.workdir:
+            with open(self.path("state.json"), "w", encoding="utf-8") as f:
+                json.dump(self.state, f, indent=1, sort_keys=True)
+
+    def say(self, msg=""):
+        print(msg, flush=True)
+        if self.log:
+            self.log.write(msg + "\n")
+            self.log.flush()
+
+    def step(self, title):
+        self.say("")
+        self.say("== " + title)
+
+    def ask(self, question):
+        if self.yes:
+            self.say(question + " [yes: --yes]")
+            return True
+        if self.dry:
+            self.say(question + " [dry run: yes]")
+            return True
+        if not sys.stdin.isatty():
+            raise MigrateError("needs an answer (%s); run in a terminal or pass --yes" % question)
+        while True:
+            a = input(question + " [y/n] ").strip().lower()
+            if a in ("y", "yes"):
+                return True
+            if a in ("n", "no"):
+                return False
+
+    def wait_user(self, what):
+        """A physical step (power, keys, cable): the user says when it's done."""
+        self.say("")
+        for line in what.strip().splitlines():
+            self.say("   " + line.strip())
+        if self.dry or self.yes:
+            self.say("   [%s: not waiting]" % ("dry run" if self.dry else "--yes"))
+            return
+        if not sys.stdin.isatty():
+            raise MigrateError("needs you at the radio; run in a terminal")
+        input("   Press Enter when done (Ctrl-C stops; your backup stays in %s) " % self.workdir)
+
+    def run(self, cmd, radio, check=True, capture=False):
+        """Run an external command. radio=True: it talks to the radio, so a dry run only prints it."""
+        shown = " ".join('"%s"' % c if " " in c else c for c in cmd)
+        if radio and self.dry:
+            self.say("   [dry run] would run: " + shown)
+            return 0, ""
+        self.say("   $ " + shown)
+        try:
+            p = subprocess.run(cmd, stdout=subprocess.PIPE if capture else None, stderr=subprocess.STDOUT
+                               if capture else None, universal_newlines=True)
+        except FileNotFoundError:
+            raise MigrateError("%s not found: install qdmr (it brings dmrconf) or give --dmrconf PATH" % cmd[0])
+        out = p.stdout or ""
+        if capture and out:
+            for line in out.rstrip().splitlines():
+                self.say("     " + line)
+        if check and p.returncode != 0:
+            raise MigrateError("%s failed (exit status %d)" % (os.path.basename(cmd[0]), p.returncode))
+        return p.returncode, out
+
+    def dmr_device(self, serial):
+        """The --device for dmrconf, or None to leave it to dmrconf. A radio running RadioFoundry is a serial port
+        (serial=True) and macOS lists each port twice (cu.X and tty.X), which stops dmrconf's own auto-detect with 'more
+        than one matching USB devices': there the port is found by USB ID, as rfoundry_debug does. A stock radio is not
+        a serial port (libusb), and step 4 (cps_client) finds its port itself, so neither is affected."""
+        if self.port:
+            return dmrconf_device(self.port, self.platform)
+        if not serial or self.platform != "darwin":
+            return None
+        if "dmrconf_device" not in self.cache:
+            try:
+                dev = dmrconf_device(self.pick_port(), self.platform)
+            except MigrateError as e:       # none found, or several: never pick one of two radios
+                if not self.dry:
+                    raise
+                self.say("   [dry run] no radio port: %s" % e)
+                dev = None
+            self.cache["dmrconf_device"] = dev
+            if dev:
+                self.say("   dmrconf device: " + dev)
+        return self.cache["dmrconf_device"]
+
+    def pick_port(self):
+        """The radio's serial port by USB ID 1FC9:0094 ($RFOUNDRY_PORT first, as for rfoundry_debug); MigrateError when
+        there is none or more than one"""
+        dbg = load_module("rfoundry_debug", ["rfoundry_debug.py"])
+        if dbg.list_ports is None:
+            raise MigrateError("pyserial is missing: pip install pyserial")
+        try:
+            return dbg.pick_port()
+        except dbg.DebugLinkError as e:
+            raise MigrateError(str(e))
+
+    def dmr(self, *args, radio, check=True, capture=False, serial=False):
+        cmd = [self.dmrconf]
+        dev = self.dmr_device(serial) if radio else None
+        if dev:
+            cmd += ["--device", dev]
+        return self.run(cmd + list(args), radio, check, capture)
+
+    def rfoundry_debug(self, *args, check=True, capture=True):
+        cmd = [sys.executable, rfoundry_debug_path()]
+        if self.port:
+            cmd += ["--port", self.port]
+        return self.run(cmd + list(args), True, check, capture)
+
+
+def full_port(port, exists=os.path.exists):
+    """macOS shows a serial port as cu.NAME (and tty.NAME) in /dev; --port may name it without the directory. pyserial
+    needs the path."""
+    if port and re.match(r"(cu|tty)\.", port) and exists("/dev/" + port):
+        return "/dev/" + port
+    return port
+
+
+def dmrconf_device(port, platform=None):
+    """The form dmrconf's --device takes. On macOS that is the short name cu.NAME (the full path is not known to
+    work), elsewhere the port as given."""
+    if (platform or sys.platform) == "darwin" and port.startswith("/dev/"):
+        return port[len("/dev/"):]
+    return port
+
+
+def need_file(sess, path, what):
+    if sess.dry and not os.path.exists(path):
+        return
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        raise MigrateError("%s was not produced (%s)" % (what, path))
+
+
+def check_dmrconf(sess):
+    if sess.cache.get("dmrconf_ok"):
+        return
+    try:
+        p = subprocess.run([sess.dmrconf, "--version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           universal_newlines=True)
+    except FileNotFoundError:
+        raise MigrateError("dmrconf not found. Install qdmr (macOS: brew install qdmr; Linux: your distribution's "
+                           "qdmr package; https://dm3mat.darc.de/qdmr/) or give --dmrconf PATH")
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", p.stdout or "")
+    ver = tuple(int(x) for x in m.groups()) if m else None
+    sess.say("dmrconf: %s (%s)" % (sess.dmrconf, ".".join(map(str, ver)) if ver else "version unknown"))
+    if ver and ver < (0, 12, 0):
+        raise MigrateError("dmrconf %s is too old: qdmr 0.12 or newer is needed (custom user database, MD-390 "
+                           "codeplug files, the OpenUV380 driver)" % ".".join(map(str, ver)))
+    sess.cache["dmrconf_ok"] = True
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# step 1: backup and convert
+
+def step_backup(sess, args):
+    sess.step("1. Back up the codeplug and convert it for RadioFoundry")
+    check_dmrconf(sess)
+    if args.source:
+        src = os.path.abspath(args.source)
+        with open(src, "rb") as f:
+            data = f.read()
+        kind = classify_codeplug(data, src)
+        sess.say("   codeplug file %s: %s, %d bytes, sha256 %s" % (src, kind, len(data), sha256(data)))
+        keep = sess.path("original" + os.path.splitext(src)[1].lower())
+        shutil.copyfile(src, keep)
+    else:
+        sess.wait_user("""
+            Radio: switch it on normally with its stock or md380tools firmware, and connect the programming
+            cable. Close the TYT CPS and any other program that uses the radio.""")
+        sess.dmr("detect", radio=True, check=False, capture=True)
+        keep = sess.path("backup-stock.dfu")
+        sess.dmr("read", "--radio", args.stock_radio, keep, radio=True)
+        need_file(sess, keep, "the codeplug read from the radio")
+        kind = "dfu"
+        if os.path.exists(keep):
+            with open(keep, "rb") as f:
+                sess.say("   saved %s, sha256 %s" % (keep, sha256(f.read())))
+    yaml_path = sess.path("backup-stock.yaml")
+    if kind == "yaml":
+        shutil.copyfile(keep, yaml_path)
+    elif kind == "raw":
+        rdt = sess.path("backup-stock.rdt")
+        with open(keep, "rb") as f:
+            raw = f.read()
+        with open(rdt, "wb") as f:
+            f.write(raw_to_rdt(raw))
+        sess.say("   wrapped the raw image as %s for dmrconf" % rdt)
+        sess.dmr("decode", "--manufacturer", "--radio", args.stock_radio, rdt, yaml_path, radio=False)
+    elif kind == "rdt":
+        sess.dmr("decode", "--manufacturer", "--radio", args.stock_radio, keep, yaml_path, radio=False)
+    else:
+        sess.dmr("decode", "--radio", args.stock_radio, keep, yaml_path, radio=args.source is None)
+    need_file(sess, yaml_path, "the codeplug in qdmr YAML")
+    sess.save_state(stock_backup=keep, stock_yaml=yaml_path)
+
+    # the conversion, offline: what restore writes is known before flashing (codeplug_port.py)
+    if not os.path.exists(yaml_path):
+        sess.say("   [dry run] the conversion (group list clean-up, encode, TX contacts put back) runs once the "
+                 "codeplug has been read")
+        return True
+    rfoundry_dfu, rfoundry_yaml, _ = cp.convert_for_rfoundry(sess, yaml_path, RFOUNDRY_DRIVER, cleanup=not args.no_cleanup)
+    need_file(sess, rfoundry_yaml, "the codeplug converted for RadioFoundry")
+    with open(yaml_path, encoding="utf-8") as f:
+        before = codeplug_summary(f.read())
+    with open(rfoundry_yaml, encoding="utf-8") as f:
+        after = codeplug_summary(f.read())
+    print_summary(sess, "stock codeplug", before)
+    print_summary(sess, "for RadioFoundry       ", after)
+    with open(sess.path("rfoundry-source.yaml"), encoding="utf-8") as f:
+        over = limit_report(codeplug_summary(f.read()))      # after the clean-up: what the encoder gets
+    for key, n, lim, dropped in over:
+        shown = ", ".join(dropped[:8]) + (" and %d more" % (len(dropped) - 8) if len(dropped) > 8 else "")
+        sess.say("   ! RadioFoundry holds %d %s, the codeplug has %d: these are left out: %s"
+                 % (lim, SECTION_NAMES[key], n, shown))
+    if over:
+        sess.say("     To choose yourself, open %s in qdmr, remove what you don't need, save it, and run" % yaml_path)
+        sess.say("     this step again with --from on the saved file.")
+        if not args.accept_trim and not sess.ask("Continue with the items that fit?"):
+            raise MigrateError("stopped before flashing; the backup is in %s" % sess.workdir)
+    if not before["radio_ids"]:
+        sess.say("   ! the codeplug has no DMR ID: set yours in qdmr after the migration (or pass --id for the ID "
+                 "database)")
+    sess.save_state(rfoundry_yaml=rfoundry_yaml, rfoundry_dfu=rfoundry_dfu, expected=after["counts"], radio_ids=before["radio_ids"])
+    prepare_users(sess, args)
+    sess.say("   backup done: %s" % sess.workdir)
+    return True
+
+
+def prepare_users(sess, args):
+    if not getattr(args, "users", None):
+        return
+    with open(args.users, encoding="utf-8", errors="replace") as f:
+        text = f.read()
+    cols = args.users_columns.split(",") if args.users_columns else None
+    users = parse_users_csv(text, cols)
+    if not users:
+        raise MigrateError("no DMR users found in %s (check --users-columns)" % args.users)
+    sess.say("   users file %s: %d DMR IDs. First records as read:" % (args.users, len(users)))
+    for u in users[:3]:
+        sess.say("     %d %s %s %s" % (u["id"], u["callsign"], u.get("fname", ""), u.get("country", "")))
+    if not sess.ask("Do these look right (ID, callsign, name, country)?"):
+        raise MigrateError("give the column order with --users-columns, e.g. id,callsign,fname,surname,city,state,"
+                           "country")
+    path = sess.path("users.json")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(users_json(users))
+    # offline check that dmrconf takes the file: encode it the way write-db will
+    ids = [args.id] if getattr(args, "id", None) else (sess.state.get("radio_ids") or [users[0]["id"]])
+    check_dmrconf(sess)
+    sess.dmr("encode-db", "--radio", RFOUNDRY_DRIVER, "--database", path, "--id", str(ids[0]), "--limit", "16",
+             sess.path("users-check.dfu"), radio=False)
+    sess.save_state(users_json=path, users_count=len(users))
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# step 2: flash
+
+def load_key(sess, args):
+    if args.key:
+        with open(args.key, "rb") as f:
+            key = f.read()
+        if len(key) != 1024 or sha256(key) != MD380_KEY_SHA256:
+            raise MigrateError("%s is not the MD-380 bootloader key (1024 bytes, sha256 %s...)"
+                               % (args.key, MD380_KEY_SHA256[:16]))
+        sess.say("   key: %s (checked)" % args.key)
+        return key
+    if args.stock:
+        sfw = stockfw()
+        with open(args.stock, "rb") as f:
+            stock = f.read()
+        sess.say("   deriving the bootloader key from %s ..." % args.stock)
+        try:
+            key = sfw.derive_key(stock, want_sha256=MD380_KEY_SHA256)
+        except sfw.StockError as e:
+            raise MigrateError(str(e))
+        sess.say("   key: derived and checked by its SHA-256")
+        return key
+    return None
+
+
+def prepare_stream(sess, args):
+    """The encrypted stream for the bootloader (None on a dry run without a key). Worked out once per run."""
+    if "stream" in sess.cache:
+        return sess.cache["stream"]
+    with open(args.image, "rb") as f:
+        data = f.read()
+    kind, info = classify_image(data)
+    sess.say("   image %s: %d bytes, sha256 %s" % (args.image, len(data), sha256(data)))
+    key = load_key(sess, args)
+    if kind == "container":
+        stream = container_stream(data, info)
+        sess.say("   a TYT updater file (already encrypted), %d bytes from 0x%08X: sent as it is"
+                 % (len(stream), APP_BASE))
+        if key is not None:
+            sp, reset = struct.unpack_from("<II", xor_key(stream[:8], key))
+            if not (0x20000000 <= sp <= 0x20020000 or 0x10000000 <= sp <= 0x10010000) or \
+                    not APP_BASE <= (reset & ~1) < FLASH_END:
+                raise MigrateError("the updater file doesn't decrypt to an MD-380 application with this key")
+            sess.say("   checked with the key: a valid vector table")
+        sess.cache["stream"] = stream
+        return stream
+    dfu = stm32_dfu()
+    if not info:
+        if args.stock:
+            sfw = stockfw()
+            with open(args.stock, "rb") as f:
+                stock = f.read()
+            try:
+                prof, segs = sfw.extract(stock, key)
+                data = sfw.merge(data, prof, segs)
+            except sfw.StockError as e:
+                raise MigrateError(str(e))
+            sess.say("   merged the codec from %s: %d bytes" % (args.stock, len(data)))
+        else:
+            sess.say("   ! this image has no codec: the radio will work on FM only (no DMR voice). Use the merged")
+            sess.say("     image (rfoundry_md380_codec.bin) or give --stock \"MD-380-D2.32(AD).bin\" to merge it.")
+            if not sess.ask("Flash it anyway?"):
+                raise MigrateError("stopped before flashing")
+    try:
+        warnings = dfu.check_image(data, "md380")
+    except dfu.DfuError as e:
+        raise MigrateError(str(e))
+    for w in warnings:
+        sess.say("   ! " + w)
+    if warnings and not args.force:
+        raise MigrateError("the image has warnings (above); fix them or pass --force")
+    if key is None:
+        if not sess.dry:
+            raise MigrateError("flashing a RadioFoundry image needs the bootloader key: --key FILE, or --stock with TYT's "
+                               "\"MD-380-D2.32(AD).bin\" to derive it")
+        sess.say("   [dry run] no --key or --stock: plan only")
+        stream = None
+    else:
+        stream = dfu.xor_image(data, key)
+    sess.cache["stream"] = stream
+    sess.cache["plain_len"] = len(data)
+    return stream
+
+
+def preflight(sess, args):
+    """Everything 'all' needs, checked before the radio leaves its stock firmware."""
+    sess.step("0. Check the tools and the image")
+    check_dmrconf(sess)
+    missing = []
+    try:
+        dfu = stm32_dfu()
+        dfu.import_usb()
+    except Exception as e:      # DfuError, or the module missing
+        missing.append("pyusb + libusb (flashing): %s" % e)
+    try:
+        import serial  # noqa: F401  (rfoundry_debug.py needs it once the radio runs RadioFoundry)
+    except ImportError:
+        missing.append("pyserial (talking to the radio on RadioFoundry): pip install pyserial")
+    rfoundry_debug_path()
+    for m in missing:
+        sess.say("   ! missing: " + m)
+    if missing and not sess.dry:
+        raise MigrateError("install what is missing first; nothing has been done to the radio")
+    prepare_stream(sess, args)
+
+
+def wait_dfu(sess, dfu, timeout):
+    usb = dfu.import_usb()
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        devs = dfu.find_devices(usb)
+        if len(devs) == 1:
+            return usb
+        if len(devs) > 1:
+            raise MigrateError("%d devices 0483:DF11 are connected: connect only the radio" % len(devs))
+        time.sleep(1)
+    raise MigrateError("the bootloader did not appear within %d s (USB 0483:DF11)" % timeout)
+
+
+def step_flash(sess, args):
+    sess.step("2. Flash RadioFoundry")
+    stream = prepare_stream(sess, args)
+    dfu = stm32_dfu()
+    shown = stream if stream is not None else bytes(sess.cache.get("plain_len", 0))
+    if shown:
+        for line in dfu.describe_plan(dfu.plan_blocks(shown), len(shown)):
+            sess.say("   " + line)
+    if sess.dry:
+        sess.say("   [dry run] would wait for the bootloader and write the image")
+        return True
+    sess.wait_user("""
+        Radio: switch it OFF. Hold PTT and the UPPER side key (the one just above PTT), and switch it on while
+        holding both. The screen stays dark and the LED blinks: that is the bootloader. Release the keys.
+        Leave the cable connected.""")
+    try:
+        usb = wait_dfu(sess, dfu, args.wait)
+        dev, intf = dfu.open_device(usb, args.force, "md380")
+        man = dfu.get_string(usb, dev, dev.iManufacturer)
+        prod = dfu.get_string(usb, dev, dev.iProduct)
+    except dfu.DfuError as e:
+        raise MigrateError(str(e))
+    sess.say("   found 0483:DF11: manufacturer %r, product %r" % (man, prod))
+    sess.say("   The radio in normal programming mode uses the same USB ID. If the screen is lit, it is NOT in the")
+    sess.say("   bootloader: answer no, and enter the bootloader as above.")
+    if not sess.ask("Is the screen dark (bootloader) and should the firmware be written now?"):
+        raise MigrateError("stopped before flashing; nothing was written")
+
+    def progress(done, total):
+        sys.stdout.write("\r   writing %d/%d blocks (%d%%)" % (done, total, done * 100 // total))
+        sys.stdout.flush()
+        if done == total:
+            sys.stdout.write("\n")
+
+    try:
+        dfu.Dfu(dev, intf, log=lambda *a: sess.say("   " + " ".join(str(x) for x in a))).flash(
+            dfu.plan_blocks(stream), progress)
+    except Exception as e:
+        raise MigrateError("flashing failed: %s. The bootloader is never erased: enter it again and rerun "
+                           "'flash'. Your codeplug backup is in %s" % (e, sess.workdir))
+    sess.say("   written; the radio restarts into RadioFoundry")
+    sess.save_state(flashed=sha256(stream))
+    return True
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# step 3: make the flash area RadioFoundry's, write the codeplug and the ID database
+
+def wait_rfoundry(sess, timeout):
+    if sess.dry:
+        sess.say("   [dry run] would wait for the radio on RadioFoundry (USB serial 1FC9:0094)")
+        return
+    cmd = [sys.executable, rfoundry_debug_path()] + (["--port", sess.port] if sess.port else []) + ["ping"]
+    sess.say("   waiting for the radio on RadioFoundry (USB serial 1FC9:0094) ...")
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+        if p.returncode == 0:
+            sess.say("   " + p.stdout.strip())
+            return
+        if "pyserial" in (p.stdout or ""):
+            raise MigrateError("pyserial is missing: pip install pyserial")
+        if "several radios found" in (p.stdout or ""):
+            raise MigrateError(p.stdout.strip())
+        time.sleep(2)
+    raise MigrateError("the radio did not answer on its USB serial port within %d s. Switch it off and on; if the "
+                       "screen stays dark, flash again (the bootloader is never erased)" % timeout)
+
+
+def step_prepare_rfoundry(sess, args):
+    sess.step("3. Check RadioFoundry on the radio and give it its settings area")
+    sess.wait_user("""
+        Radio: it should be running RadioFoundry now (the RadioFoundry home screen). If the screen is dark, switch it off and on
+        normally. Keep the cable connected.""")
+    wait_rfoundry(sess, args.wait)
+    rc, out = sess.rfoundry_debug("version")
+    if not sess.dry and "MD-380" not in out:
+        raise MigrateError("the radio does not report board=MD-380 over its debug link (see above)")
+    rc, out = sess.rfoundry_debug("storage", "info")
+    region = re.search(r"region\s+(\w+)", out or "")
+    region = region.group(1) if region else ("foreign" if sess.dry else "?")
+    if region == "none":
+        raise MigrateError("RadioFoundry found no usable SPI flash: this radio has the small (1 MB) flash part, or the flash "
+                           "was not detected. RadioFoundry runs on this radio but keeps nothing (no codeplug, no settings), "
+                           "so there is nothing to restore. Your backup is in %s" % sess.workdir)
+    if region == "foreign":
+        sess.say("   The flash area RadioFoundry keeps its settings in still holds the stock firmware's data. RadioFoundry doesn't")
+        sess.say("   overwrite it on its own. Your stock codeplug is already backed up; this saves the area again")
+        sess.say("   (raw) into the work directory and then gives it to RadioFoundry.")
+        if not sess.ask("Give the settings area to RadioFoundry now?"):
+            raise MigrateError("stopped: codeplug writes are refused until the area is RadioFoundry's")
+        sess.rfoundry_debug("storage", "claim", "--out", sess.path("storage-before-claim"))
+    elif region != "ours":
+        raise MigrateError("unexpected storage state %r" % region)
+    sess.say("   the settings area is RadioFoundry's")
+    return True
+
+
+def open_cps(sess):
+    return load_module("cps_client", ["cps_client.py"]).open_cps(sess.port)
+
+
+def step_restore(sess, args):
+    sess.step("4. Write the codeplug to the radio")
+    check_dmrconf(sess)
+    if args.yaml:
+        src = os.path.abspath(args.yaml)
+        if not os.path.isfile(src):
+            raise MigrateError("%s not found" % src)
+        rfoundry_dfu, rfoundry_yaml, _ = cp.convert_for_rfoundry(sess, src, RFOUNDRY_DRIVER, cleanup=not args.no_cleanup)
+        with open(rfoundry_yaml, encoding="utf-8") as f:
+            sess.save_state(rfoundry_yaml=rfoundry_yaml, rfoundry_dfu=rfoundry_dfu, expected=codeplug_summary(f.read())["counts"])
+    src = sess.state.get("rfoundry_dfu")
+    if sess.dry and not src:
+        sess.say("   [dry run] would write rfoundry-codeplug.dfu through RadioFoundry's CPS shim, then read it back and compare")
+        return True
+    if not src or (not sess.dry and not os.path.isfile(src)):
+        raise MigrateError("no converted codeplug: run 'backup' first or give --yaml FILE")
+    # dmrconf's own write reads the radio first, and that read fails against RadioFoundry (#9): cps_client writes the same
+    # regions qdmr would, with what was there saved first
+    targets, img = cp.cps_write_dfu(sess, lambda: open_cps(sess), src, "codeplug", "codeplug-before.bin")
+    if sess.dry:
+        return True
+    sess.say("   written; the radio restarts")
+    time.sleep(3)
+    wait_rfoundry(sess, args.wait)
+    cp.check_read_back(sess, lambda: open_cps(sess), targets, img, sess.state.get("expected"), RFOUNDRY_DRIVER)
+    sess.save_state(restored=True)
+    return True
+
+
+def step_iddb(sess, args):
+    sess.step("5. Write the DMR ID (callsign) database")
+    if args.no_db:
+        sess.say("   skipped (--no-db)")
+        return True
+    ids = [args.id] if args.id else (sess.state.get("radio_ids") or [])
+    if not ids:
+        raise MigrateError("no DMR ID to choose the database around: give --id YOUR_ID, or --no-db")
+    cmd = ["write-db", "--radio", RFOUNDRY_DRIVER, "--id", ",".join(str(i)[:3] if args.id_prefix else str(i) for i in ids)]
+    users = args.users_json or sess.state.get("users_json")
+    if users:
+        cmd += ["--database", users]
+        sess.say("   from your users file (%s records)" % sess.state.get("users_count", "?"))
+    else:
+        sess.say("   dmrconf downloads the public DMR user database (internet needed)")
+    if args.db_limit:
+        cmd += ["--limit", str(args.db_limit)]
+    sess.say("   a large database takes several minutes over USB; don't unplug the radio")
+    wait_rfoundry(sess, args.wait)
+    sess.dmr(*cmd, radio=True, serial=True)
+    sess.say("   done: names show on the receive screen for IDs that are not contacts")
+    return True
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# package for a tester
+
+PACKAGE_README = """\
+RadioFoundry for the TYT MD-380 / MD-390 / Retevis RT3: migration kit (TESTING ONLY)
+
+This kit moves a radio from its stock or md380tools firmware to RadioFoundry and keeps your channels, zones,
+contacts, RX group lists and the DMR ID database. The firmware has not been proven on every radio yet: keep the
+TYT updater and your stock firmware file at hand to go back.
+
+Not for redistribution: the merged firmware image contains the codec from TYT's firmware.
+The image is built for one band: rfoundry_md380_codec.bin from a UHF build for a UHF radio, from a VHF build
+(BAND=vhf) for a VHF radio. The band is on the label under the battery.
+
+Install once
+  - Python 3.8 or newer.
+  - qdmr 0.12 or newer, which brings the dmrconf command (macOS: brew install qdmr; Linux: the qdmr package of
+    your distribution; Windows: the qdmr installer from https://dm3mat.darc.de/qdmr/).
+  - pip install -r requirements.txt   (pyusb and pyserial)
+  - libusb: macOS brew install libusb; Linux apt install libusb-1.0-0 (and a udev rule for 0483:df11, which
+    the tool prints when access is denied; add yourself to the dialout group for the serial port).
+  - Windows (untested): bind "STM32 BOOTLOADER" / 0483:DF11 to WinUSB with Zadig for flashing. That binding also
+    replaces the driver the TYT CPS uses; run the backup step first.
+
+Run
+  python3 md380_migrate.py all --image {image}{keyarg} --dry-run     (see every step, touches nothing)
+  python3 md380_migrate.py all --image {image}{keyarg}
+
+The tool asks before each step that needs you at the radio (switching on, the bootloader keys). It keeps every file
+in ~/RadioFoundry-MD380-migration/<date-time>/ and never deletes them. If a step fails it stops and says how to go on;
+'restore --workdir DIR' continues after the flash.
+"""
+
+
+def cmd_package(sess, args):
+    out = os.path.abspath(args.outdir)
+    files = {os.path.abspath(__file__): "md380_migrate.py",
+             os.path.join(HERE, "stm32_dfu.py"): "stm32_dfu.py",
+             os.path.join(HERE, "rfoundry_debug.py"): "rfoundry_debug.py",
+             os.path.join(HERE, "codeplug_port.py"): "codeplug_port.py",
+             os.path.join(HERE, "cps_client.py"): "cps_client.py"}
+    files.update(cp.kit_package_files())
+    for img in args.image:
+        files[os.path.abspath(img)] = os.path.basename(img)
+    for extra in args.include or []:
+        files[os.path.abspath(extra)] = os.path.basename(extra)
+    for src in files:
+        if not os.path.isfile(src):
+            raise MigrateError("%s not found" % src)
+    sess.say("package %s:" % out)
+    for src, dst in files.items():
+        sess.say("   %s <- %s" % (dst, src))
+    if sess.dry:
+        return True
+    os.makedirs(out, exist_ok=True)
+    for src, dst in files.items():
+        os.makedirs(os.path.dirname(os.path.join(out, dst)), exist_ok=True)
+        shutil.copyfile(src, os.path.join(out, dst))
+    keyarg = ' --stock "MD-380-D2.32(AD).bin"'
+    if any(os.path.basename(x).endswith(".key") for x in args.include or []):
+        keyarg = " --key " + next(os.path.basename(x) for x in args.include if x.endswith(".key"))
+    with open(os.path.join(out, "README.txt"), "w", encoding="utf-8") as f:
+        f.write(PACKAGE_README.format(image=os.path.basename(args.image[0]), keyarg=keyarg))
+    with open(os.path.join(out, "requirements.txt"), "w", encoding="utf-8") as f:
+        f.write("pyusb>=1.2\npyserial>=3.4\n")
+    with open(os.path.join(out, "SHA256SUMS"), "w", encoding="utf-8") as f:
+        for dst in sorted(set(files.values())):
+            with open(os.path.join(out, dst), "rb") as g:
+                f.write("%s  %s\n" % (sha256(g.read()), dst))
+    sess.say("   done: hand the directory over as it is (README.txt says what to install)")
+    return True
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# self-test
+
+def self_test():
+    fails = []
+
+    def check(cond, what):
+        if not cond:
+            fails.append(what)
+            print("FAIL: " + what)
+
+    raw = bytes(range(256)) * (CODEPLUG_SIZE // 256)
+    rdt = raw_to_rdt(raw)
+    check(len(rdt) == 262709 and rdt[RDT_HEADER:RDT_HEADER + CODEPLUG_SIZE] == raw, "raw image wrapped as .rdt")
+    check(classify_codeplug(rdt, "x.rdt") == "rdt", "classify rdt")
+    check(classify_codeplug(raw, "x.img") == "raw", "classify raw")
+    check(classify_codeplug(b"DfuSe\x01" + bytes(300), "x.dfu") == "dfu", "classify dfu")
+    check(classify_codeplug(b"version: 0.15.1\n", "x.yaml") == "yaml", "classify yaml")
+    for bad in (bytes(1000), bytes(0x1000000)):
+        try:
+            classify_codeplug(bad, "bad.bin")
+            check(False, "classify rejects %d bytes" % len(bad))
+        except MigrateError:
+            pass
+
+    y = """version: 0.15.1
+settings:
+  defaultID: id1
+  boot:
+    message1: RadioFoundry
+radioIDs:
+  - dmr: {id: id1, name: Q1AAA, number: 9990001}
+contacts:
+  - dmr: {id: cont1, name: Local, ring: false, type: GroupCall, number: 9}
+  - dmr: {id: cont2, name: "Alice, A", ring: false, type: PrivateCall, number: 9990002}
+groupLists:
+  - id: grp1
+    name: Local
+    contacts: [cont1]
+channels:
+  - dmr:
+      id: ch1
+      name: Simplex DMR
+      rxFrequency: 441 MHz
+  - fm:
+      id: ch2
+      name: Simplex FM
+zones:
+""" + "".join("  - id: zone%d\n    name: Z%d\n    A: [ch1, ch2]\n" % (i, i) for i in range(1, 71)) + \
+        "scanLists: []\npositioning: []\n"
+    s = codeplug_summary(y)
+    check(s["counts"] == {"channels": 2, "zones": 70, "contacts": 2, "groupLists": 1}, "section counts %r" % s["counts"])
+    check(s["names"]["channels"] == ["Simplex DMR", "Simplex FM"], "channel names")
+    check(s["names"]["contacts"][1] == "Alice, A", "quoted name with a comma")
+    check(s["radio_ids"] == [9990001], "radio ID")
+    rep = limit_report(s)
+    check(len(rep) == 1 and rep[0][:3] == ("zones", 70, 68) and rep[0][3] == ["Z69", "Z70"], "zone limit report")
+    check(yaml_sections(y).get("scanLists") == [], "empty flow list")
+    exp = {"channels": 2, "zones": 70, "contacts": 2, "groupLists": 1}
+    check(compare_counts(exp, {"channels": 2, "zones": 68, "contacts": 2, "groupLists": 1}) == [],
+          "read back after the zone limit matches")
+    check(compare_counts(exp, {"channels": 1, "zones": 68, "contacts": 2, "groupLists": 1}) == [("channels", 2, 1)],
+          "a lost channel is found")
+
+    radioid = ("RADIO_ID,CALLSIGN,FIRST_NAME,LAST_NAME,CITY,STATE,COUNTRY,REMARKS\n"
+               "9990002,q2bbb,Bob,Jones,Austin,Texas,United States,\n"
+               "9990001,Q1AAA,Alice,Smith,Denver,Colorado,United States,x\n"
+               "9990001,DUPE,Dup,,,,,\n"
+               "notanid,X,,,,,,\n")
+    u = parse_users_csv(radioid)
+    check([x["id"] for x in u] == [9990001, 9990002], "radioid.net csv: sorted, deduplicated")
+    check(u[1] == {"id": 9990002, "callsign": "Q2BBB", "fname": "Bob", "surname": "Jones", "city": "Austin",
+                   "state": "Texas", "country": "United States"}, "radioid.net csv fields %r" % (u[1],))
+    plain = "123456\n9990003,W1AW,Hiram,Maxim,Newington,CT,United States\n\n7,X\n"
+    u = parse_users_csv(plain)
+    check(len(u) == 2 and u[1]["callsign"] == "W1AW" and u[1]["city"] == "Newington", "headerless, size line skipped")
+    u = parse_users_csv("9990004,Jane,Q3CCC\n", ["id", "fname", "callsign"])
+    check(u == [{"id": 9990004, "callsign": "Q3CCC", "fname": "Jane"}], "custom columns")
+    j = json.loads(users_json(u))
+    check(j == {"users": [{"id": 9990004, "callsign": "Q3CCC", "fname": "Jane"}]}, "users json")
+
+    img = struct.pack("<II", 0x20020000, APP_BASE + 0x1001) + bytes(0x100)
+    check(classify_image(img) == ("plain", False), "plain image without codec")
+    merged = bytearray(b"\xFF" * (CODEC_SIG_ADDR - APP_BASE + 0x100))
+    merged[0:8] = img[:8]
+    struct.pack_into("<I", merged, CODEC_SIG_ADDR - APP_BASE, CODEC_SIG)
+    check(classify_image(bytes(merged)) == ("plain", True), "merged image")
+    key = bytes((i * 37 + 11) & 0xFF for i in range(1024))
+    payload = bytes((i * 7) & 0xFF for i in range(5000))
+    enc = xor_key(payload, key)
+    cont = bytearray(CONTAINER_MAGIC + bytes(CONTAINER_HEADER - len(CONTAINER_MAGIC)))
+    struct.pack_into("<I", cont, 0x7C, 0xFFFFFFFF)
+    struct.pack_into("<II", cont, 0x80, APP_BASE, len(enc))
+    cont = bytes(cont) + enc + bytes(0x100)
+    kind, segs = classify_image(cont)
+    check(kind == "container" and segs == [(APP_BASE, len(enc))], "single-segment updater file")
+    stream = container_stream(cont, segs)
+    check(stream == enc and xor_key(stream, key) == payload, "updater payload is the bootloader stream")
+    try:
+        container_stream(cont, [(0x00060000, 16)])
+        check(False, "a file not at 0x0800C000 is refused")
+    except MigrateError:
+        pass
+
+    # dmrconf's --device: the short name on macOS (/dev/cu.X or cu.X given), the port as given elsewhere
+    check(dmrconf_device("/dev/cu.usbmodem1", "darwin") == "cu.usbmodem1", "macOS: /dev/cu.X becomes cu.X")
+    check(dmrconf_device("cu.usbmodem1", "darwin") == "cu.usbmodem1", "macOS: cu.X stays")
+    check(dmrconf_device("/dev/ttyACM0", "linux") == "/dev/ttyACM0", "Linux: the path stays")
+    check(full_port("cu.usbmodem1", lambda p: p == "/dev/cu.usbmodem1") == "/dev/cu.usbmodem1", "cu.X gets /dev/")
+    check(full_port("cu.nothere", lambda p: False) == "cu.nothere", "a name that is no device stays")
+    check(full_port("/dev/ttyACM0") == "/dev/ttyACM0" and full_port(None) is None, "full paths and None stay")
+
+    def session(port, platform, dry=False):
+        sess = Session(argparse.Namespace(dry_run=dry, yes=True, port=port, dmrconf="dmrconf"))
+        sess.platform, sess.say = platform, lambda msg="": None
+        return sess
+
+    def device(port, ports, platform, dry=False, serial=True):
+        """dmr_device with the USB search faked: `ports` is what pick_port finds; (device, error text)"""
+        sess = session(port, platform, dry)
+
+        def pick_port():
+            if len(ports) != 1:
+                raise MigrateError("no radio found" if not ports else "several radios found %s" % ports)
+            return ports[0]
+        sess.pick_port = pick_port
+        try:
+            return sess.dmr_device(serial), None
+        except MigrateError as e:
+            return None, str(e)
+    mac = "/dev/cu.usbmodem0000000100001"
+    check(device(None, [mac], "darwin") == ("cu.usbmodem0000000100001", None), "auto-detect on macOS: the one radio, short name")
+    check(device(None, [mac], "linux") == (None, None), "Linux: left to dmrconf")
+    check(device("/dev/ttyACM0", [mac], "linux") == ("/dev/ttyACM0", None), "Linux: --port as given")
+    check(device("/dev/cu.x", [mac], "darwin") == ("cu.x", None), "--port /dev/cu.x wins and is shortened")
+    check(device("cu.x", [], "darwin") == ("cu.x", None), "--port cu.x wins")
+    check(device(None, [mac], "darwin", serial=False) == (None, None), "a stock radio: no auto-detect")
+    check("several" in (device(None, [mac, mac + "2"], "darwin")[1] or ""), "two radios: stop, not pick one")
+    check("no radio" in (device(None, [], "darwin")[1] or ""), "no radio: stop")
+    check(device(None, [], "darwin", dry=True) == (None, None), "a dry run without a radio goes on")
+
+    # the real pick_port, with rfoundry_debug faked: its errors become MigrateError, a missing pyserial is named
+    class DebugLinkError(Exception):
+        pass
+
+    def fake_debug(list_ports, ports):
+        def pick_port():
+            if len(ports) != 1:
+                raise DebugLinkError("several radios found %s: give --port" % ports)
+            return ports[0]
+        return type("M", (), {"list_ports": list_ports, "pick_port": staticmethod(pick_port), "DebugLinkError": DebugLinkError})
+
+    real = globals()["load_module"]
+    try:
+        for dbg, want in ((fake_debug(None, [mac]), "pyserial is missing"), (fake_debug(True, [mac, mac + "2"]), "several radios"),
+                          (fake_debug(True, [mac]), None)):
+            globals()["load_module"] = lambda name, cands, dbg=dbg: dbg
+            try:
+                got = session(None, "darwin").pick_port()
+                check(want is None and got == mac, "pick_port finds the one radio")
+            except MigrateError as e:
+                check(want is not None and want in str(e), "pick_port: %s (got %r)" % (want, str(e)))
+    finally:
+        globals()["load_module"] = real
+
+    # What --stock and the flash load, here and from a kit. None of it needs the stock file
+    check(stockfw().codecmap.load_maps(), "stockfw loads, with the codec maps")
+    err = cp.kit_error(__file__, b"\x01" * 64, "import md380_migrate as m\nm.stockfw()\nm.stm32_dfu()\nimport cps_client")
+    check(not err, "a kit runs on its own: %s" % err)
+
+    print("self-test %s (%d failure%s)" % ("PASSED" if not fails else "FAILED", len(fails),
+                                          "" if len(fails) == 1 else "s"))
+    return 0 if not fails else 1
+
+
+# ---------------------------------------------------------------------------------------------------------------
+
+EPILOG = """\
+examples:
+  %(prog)s all --image rfoundry_md380_codec.bin --stock "MD-380-D2.32(AD).bin" --dry-run
+  %(prog)s all --image rfoundry_md380_codec.bin --key md380.key --users user.csv
+  %(prog)s backup --from KD4Z-codeplug.rdt
+  %(prog)s flash --image rfoundry_md380.bin --stock "MD-380-D2.32(AD).bin"      (merges the codec)
+  %(prog)s flash --image "MD-380-D2.32(AD).bin"                            (back to stock: a TYT updater file)
+  %(prog)s restore --workdir ~/RadioFoundry-MD380-migration/20261011-101500
+
+The steps of 'all': backup (radio on stock firmware) -> flash (bootloader) -> settings area -> codeplug -> ID
+database. Each asks before anything happens at the radio; it stops at the first failure and never deletes a file.
+"""
+
+
+def main(argv=None):
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--dry-run", action="store_true", help="run the offline steps; print what would touch the radio")
+    common.add_argument("--yes", "-y", action="store_true", help="don't ask (physical steps are still announced)")
+    common.add_argument("--workdir", help="where backups and converted files go (default ~/RadioFoundry-MD380-migration/DATE)")
+    common.add_argument("--port", help="the radio's serial port once it runs RadioFoundry (found by USB ID otherwise)")
+    common.add_argument("--dmrconf", help="path of dmrconf (default: from PATH)")
+    common.add_argument("--wait", type=int, default=120, help="seconds to wait for the radio (default 120)")
+
+    u = argparse.ArgumentParser(add_help=False)
+    u.add_argument("--users", metavar="CSV", help="DMR users file (radioid.net user.csv, md380tools / KD4Z users "
+                                                 "file) for the ID database; default: dmrconf downloads it")
+    u.add_argument("--users-columns", help="column order of a users file without a header, e.g. "
+                                           "id,callsign,fname,surname,city,state,country")
+
+    c = argparse.ArgumentParser(add_help=False)
+    c.add_argument("--no-cleanup", action="store_true", help="convert the codeplug as it is: keep every RX group list "
+                   "(by default lists that are empty or only repeat the channel's TX contact are dropped)")
+    b = argparse.ArgumentParser(add_help=False)
+    b.add_argument("--from", dest="source", metavar="FILE",
+                   help="convert this codeplug file instead of reading the radio: TYT CPS / KD4Z toolkit .rdt, a raw "
+                        "256 KB md380tools image, a dmrconf .dfu, or qdmr YAML")
+    b.add_argument("--stock-radio", default=STOCK_DRIVER, choices=("md390", "rt8"),
+                   help="dmrconf driver for the stock codeplug (default md390; the MD-380 and RT3 use the same format)")
+    b.add_argument("--accept-trim", action="store_true", help="continue without asking when zones or RX group lists "
+                                                              "don't all fit RadioFoundry")
+
+    f = argparse.ArgumentParser(add_help=False)
+    f.add_argument("--image", required=True, help="the RadioFoundry image (rfoundry_md380_codec.bin, or rfoundry_md380.bin with --stock), "
+                                                  "or a TYT updater file")
+    f.add_argument("--key", help="the 1024-byte MD-380 bootloader key file (checked by SHA-256)")
+    f.add_argument("--stock", metavar="FILE", help="TYT's \"MD-380-D2.32(AD).bin\": gives the key and, for an image "
+                                                   "without it, the codec")
+    f.add_argument("--force", action="store_true", help="flash although the image has warnings")
+
+    r = argparse.ArgumentParser(add_help=False)
+    r.add_argument("--yaml", help="write this qdmr YAML instead of the converted backup (converted the same way)")
+    r.add_argument("--id", type=int, help="your DMR ID, for choosing the ID database (default: from the codeplug)")
+    r.add_argument("--id-prefix", action="store_true", help="choose the database by the ID's 3-digit prefix "
+                                                            "(your country) instead of nearest IDs")
+    r.add_argument("--users-json", help="a user database in dmrconf's JSON form (default: from backup --users)")
+    r.add_argument("--db-limit", type=int, help="at most this many database records")
+    r.add_argument("--no-db", action="store_true", help="don't write the ID database")
+
+    ap = argparse.ArgumentParser(description="Move a TYT MD-380 / MD-390 / Retevis RT3 from stock or md380tools "
+                                             "firmware to RadioFoundry, keeping the codeplug and the ID database.",
+                                 epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--self-test", action="store_true", help="test the conversion logic (no radio, no dmrconf)")
+    sub = ap.add_subparsers(dest="cmd")
+    sub.add_parser("backup", parents=[common, b, c, u], help="read (or import) the codeplug and convert it for RadioFoundry")
+    sub.add_parser("flash", parents=[common, f], help="flash RadioFoundry through the TYT bootloader")
+    sub.add_parser("restore", parents=[common, r, c, u], help="settings area, codeplug and ID database to the radio on RadioFoundry")
+    sub.add_parser("all", parents=[common, b, f, r, c, u], help="backup, flash, restore")
+    p = sub.add_parser("package", parents=[common], help="a directory for a tester")
+    p.add_argument("outdir")
+    p.add_argument("--image", action="append", required=True, help="image(s) to include")
+    p.add_argument("--include", action="append", help="further files (a key file, the stock firmware file)")
+    args = ap.parse_args(argv)
+
+    if args.self_test:
+        return self_test()
+    if not args.cmd:
+        ap.print_help()
+        return 2
+    sess = Session(args)
+    try:
+        if args.cmd == "package":
+            return 0 if cmd_package(sess, args) else 1
+        if args.cmd == "restore":
+            sess.open_workdir(args.workdir, create=args.workdir is None or args.yaml is not None)
+            if not args.yaml and not sess.state.get("rfoundry_yaml"):
+                raise MigrateError("no converted codeplug in %s: give --workdir of an earlier backup, or --yaml"
+                                   % sess.workdir)
+            prepare_users(sess, args)
+            step_prepare_rfoundry(sess, args)
+            step_restore(sess, args)
+            step_iddb(sess, args)
+        else:
+            sess.open_workdir(args.workdir)
+            if args.cmd == "all":
+                preflight(sess, args)
+            if args.cmd in ("backup", "all"):
+                step_backup(sess, args)
+            if args.cmd in ("flash", "all"):
+                if args.cmd == "all":
+                    if not sess.ask("The codeplug is backed up. Flash RadioFoundry now?"):
+                        raise MigrateError("stopped before flashing; the backup is in %s" % sess.workdir)
+                step_flash(sess, args)
+            if args.cmd == "all":
+                step_prepare_rfoundry(sess, args)
+                step_restore(sess, args)
+                step_iddb(sess, args)
+        sess.say("")
+        sess.say("finished%s. Files: %s" % (" (dry run: nothing was written to the radio)" if sess.dry else "",
+                                            sess.workdir))
+        return 0
+    except MigrateError as e:
+        sess.say("")
+        sess.say("stopped: %s" % e)
+        if sess.state.get("flashed") and sess.state.get("rfoundry_yaml") and args.cmd in ("all", "restore"):
+            sess.say("to continue once the cause is fixed: %s restore --workdir \"%s\""
+                     % (os.path.basename(sys.argv[0]), sess.workdir))
+        return 1
+    except KeyboardInterrupt:
+        sess.say("")
+        sess.say("stopped by you. Files: %s" % (sess.workdir or "-"))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

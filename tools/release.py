@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 The RadioFoundry Authors
+"""Package built firmware images as release artifacts (docs/dev/release.md "Release artifacts").
+
+    tools/release.py --board ID --version v26.11 [--bin build/ID/rfoundry_ID.bin] [--out dist]
+    tools/release.py --board ID --variant amateur --version v26.11     a release variant (make VARIANT=amateur)
+    tools/release.py --board ID --version v26.11     on an HR_C7000 radio build/ID/rfoundry_ID.bin is the image without
+                                                     the codec slot (never the _codec.bin)
+    tools/release.py --board ID --build-option BAND=vhf --version v26.11   a build option's image (board.toml
+                                                     [[build_options]]): build/ID-vhf/rfoundry_ID-vhf.bin, rfoundry-ID-vhf-<version>
+
+Writes, into --out:
+  rfoundry-<board>-<version>.bin    the codec-less image, as built (a variant or a build option value:
+                               rfoundry-<board>-<variant>-<value>-<version>.bin)
+  rfoundry-<board>-<version>.json   its manifest (board, variant, version, git hash, image ranges, codec profile, sectors)
+  SHA256SUMS                   one line per file (appended; one file for the whole release)
+
+Refuses an image that reaches into a codec sector or that carries the codec signature, so a release can never ship
+the codec or break "keep the radio's codec" (tools/rfoundry).
+"""
+import argparse
+import hashlib
+import os
+import struct
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "rfoundry"))
+from rfoundry import boards, manifest as mf, serialflash, stockfw  # noqa: E402
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def git(*a):
+    return subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, text=True, check=True).stdout.strip()
+
+
+def make_print(board_id, goal, variant=None, options=()):
+    """The words a make print-* goal prints for the build"""
+    cmd = (["make", "-s", "-C", ROOT, "BOARD=" + board_id, goal] + (["VARIANT=" + variant] if variant else [])
+           + ["%s=%s" % o for o in sorted(dict(options).items())])
+    return subprocess.run(cmd, capture_output=True, text=True).stdout.split()
+
+
+def features(board_id, variant=None, options=(), value="y"):
+    """The switches the build has at value (y: on, n: off) as a comma list (make print-config). Off leaves out what the
+    board can't have (BOARD_UNSUPPORTED, BOARD_NOT_WRITTEN), as the radio's VERSION off= does (Makefile RFOUNDRY_OFF)"""
+    names = [kv.split("=")[0] for kv in make_print(board_id, "print-config", variant, options) if kv.endswith("=" + value)]
+    if value == "n":
+        never = {n for goal in ("print-unsupported", "print-not-written") for n in make_print(board_id, goal, variant, options)}
+        names = [n for n in names if n not in never]
+    return ",".join(names)
+
+
+def toolchain(board_id):
+    r = subprocess.run(["make", "-s", "-C", ROOT, "BOARD=" + board_id, "print-cc"], capture_output=True, text=True)
+    cc = r.stdout.strip()
+    try:
+        v = subprocess.run([cc, "--version"], capture_output=True, text=True).stdout.splitlines()[0]
+    except (OSError, IndexError):
+        v = cc
+    return v
+
+
+def check_no_codec(board, image):
+    """The release image must not contain any codec bytes: it ends before the codec sectors (manifest.generate checks
+    that), and the codec must not be where a merged image puts it: an STM32 radio's code window (its first word), or
+    the stock address, where merges from before the codec moved put it (the stock code, by its SHA-256: the image's
+    own code reaches past those addresses now, and the codec's first word, a push, is common there), an HR_C7000
+    radio's codec slot (the build's _codec.bin)."""
+    off = board.codec.windows[0][0] - board.app_base
+    if board.codec_slot is None:	# a codec merged from a stock file at the stock placement
+        stock = {(p["code"][0] - board.app_base, p["code"][1], p["code"][2]) for p in stockfw.PROFILES.values() if p["board"] == board.id}
+        if (off + 4 <= len(image) and struct.unpack_from("<I", image, off)[0] == stockfw.CODEC_SIG) or any(
+                o + n <= len(image) and hashlib.sha256(image[o:o + n]).hexdigest() == sha for o, n, sha in stock):
+            raise SystemExit("release: %s carries the codec signature: never release a merged image" % board.id)
+    else:				# a codec in RadioFoundry's own slot
+        if off + 4 <= len(image) and struct.unpack_from("<I", image, off)[0] == serialflash.SLOT_MAGIC:
+            raise SystemExit("release: the %s image carries the codec slot (a _codec.bin): release rfoundry_%s.bin, never "
+                             "a merged image" % (board.name, board.id))
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--board", required=True)
+    ap.add_argument("--version", required=True, help="the release tag, e.g. v26.11")
+    ap.add_argument("--variant", help="a release variant (config/variants/<name>.mk); default: the full build")
+    ap.add_argument("--build-option", action="append", default=[], metavar="NAME=VALUE",
+                    help="a board build option's value other than its default (boards/<board>/board.toml "
+                         "[[build_options]]): its own image, build directory and file names")
+    ap.add_argument("--bin", help="the built image (default build/<board>[-<variant>]/rfoundry_<board>.bin, or "
+                    "rfoundry_<board>_install.bin for a board with a first stage)")
+    ap.add_argument("--out", default=os.path.join(ROOT, "dist"))
+    ap.add_argument("--git", help="full commit hash (default: git rev-parse HEAD)")
+    ap.add_argument("--features", help="feature list (default: make print-config)")
+    ap.add_argument("--toolchain", help="compiler version line (default: the board's compiler --version)")
+    args = ap.parse_args(argv)
+
+    try:
+        board = boards.get(args.board)
+    except KeyError as e:
+        raise SystemExit("release: %s" % e.args[0])
+    variant = None if args.variant in (None, "", "full") else args.variant
+    if variant and not os.path.isfile(os.path.join(ROOT, "config", "variants", variant + ".mk")):
+        raise SystemExit("release: unknown variant %s (config/variants/)" % variant)
+    options = {}
+    for opt in args.build_option:
+        name, _, value = opt.partition("=")
+        if board.build_option(name, value) is None:
+            raise SystemExit("release: %s has no build option %s=%s (its options: %s)"
+                             % (board.id, name, value, ", ".join("%s=%s" % (o["name"], "|".join(v["id"] for v in o["values"]))
+                                                                for o in board.build_options) or "none"))
+        options[name] = value
+    # the Makefile's names (rfoundry/names.py): a non-default value is in the build directory and the image
+    # (build/md380-vhf/rfoundry_md380-vhf.bin)
+    path = args.bin or os.path.join(ROOT, board.build_image(options, variant))
+    with open(path, "rb") as f:
+        image = f.read()
+    check_no_codec(board, image)
+    # the image is written at app_base, where the first stage lives: the application alone would replace it
+    if board.first_stage:
+        size, head = board.first_stage
+        if len(image) <= size or not image.startswith(head):
+            raise SystemExit("release: the %s image must start with its first stage: release rfoundry_%s_install.bin, not the "
+                             "application alone" % (board.name, board.id))
+    commit = args.git or git("rev-parse", "HEAD")
+    feats = args.features if args.features is not None else features(board.id, variant, options)
+    tc = args.toolchain if args.toolchain is not None else toolchain(board.id)
+    # variant and build option images carry them in their names; the full default build keeps the plain names rfoundry
+    # fetches
+    name_id = board.release_id(options, variant)
+    bin_name = mf.image_name(name_id, args.version)
+    json_name = mf.image_name(name_id, args.version, "json")
+    try:
+        man = mf.generate(board, image, args.version, commit, feats, tc, file_name=bin_name)
+    except mf.ManifestError as e:
+        raise SystemExit("release: %s" % e)
+    man["variant"] = variant or "full"
+    # every switch the build has off: with features, the switches this release knew, so the web flasher's update tells
+    # a feature added since from one a custom build left on (site/static/js/flasher/update.js)
+    if args.features is None:
+        man["off"] = features(board.id, variant, options, "n")
+    # the commit's time, which the web editor compares with a radio's git_time= to offer this release to a build that
+    # isn't one (docs/dev/codeplug-editor.md)
+    try:
+        man["git_time"] = int(git("show", "-s", "--format=%ct", commit))
+    except (subprocess.CalledProcessError, ValueError):
+        pass
+    if options:
+        man["build_options"] = dict(options)
+    whole = image
+    mf.verify(man, whole, board.id)
+
+    os.makedirs(args.out, exist_ok=True)
+    text = mf.dumps(man)
+    with open(os.path.join(args.out, bin_name), "wb") as f:
+        f.write(whole)
+    with open(os.path.join(args.out, json_name), "w", encoding="utf-8") as f:
+        f.write(text)
+    sums = os.path.join(args.out, "SHA256SUMS")
+    old = []
+    if os.path.exists(sums):
+        with open(sums, "r", encoding="ascii") as f:
+            old = [ln for ln in f if not ln.rstrip().endswith((" " + bin_name, " " + json_name))]
+    with open(sums, "w", encoding="ascii") as f:
+        f.writelines(old)
+        f.write(mf.sha256sums_line(bin_name, whole))
+        f.write(mf.sha256sums_line(json_name, text.encode("utf-8")))
+    print("release: %s (%d bytes, sectors %s; codec %s in sectors %s, not included)"
+          % (bin_name, len(whole), man["sectors"], man["codec"]["profile"], man["codec"]["sectors"]))
+    print("release: %s, SHA256SUMS in %s" % (json_name, args.out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
