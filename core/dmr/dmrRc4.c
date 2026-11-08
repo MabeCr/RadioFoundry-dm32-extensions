@@ -8,10 +8,12 @@
 
 void dmrRc4Init(dmrRc4_t *c, const uint8_t *key, size_t keyLen)
 {
+	static const uint8_t zeroKey[1] = { 0 }; // function scope: an invalid length falls back to it, which must outlive the if
+
 	if ((keyLen == 0) || (keyLen > 256))
 	{
 		keyLen = 1;
-		key = (const uint8_t[]){ 0 };
+		key = zeroKey;
 	}
 
 	for (int n = 0; n < 256; n++)
