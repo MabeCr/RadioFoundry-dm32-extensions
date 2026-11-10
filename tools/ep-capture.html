@@ -1,0 +1,496 @@
+<!-- SPDX-License-Identifier: MIT -->
+<!-- Copyright (c) 2026 The RadioFoundry Authors -->
+<!--
+  EP capture: a one-page, no-install front end for the debug link's EP_CAPTURE command (CONFIG_EP_CAPTURE,
+  docs/spec/debuglink.md 3.25). Connects to the radio's programming cable over Web Serial, right in the browser
+  (Chrome or Edge on a computer; no Python, no install). Turns capture on, polls the ring, and lets you save what
+  it collected as a JSON file to send along.
+
+  This is a private tool for a private feature: CONFIG_EP_CAPTURE is off by default and not part of any upstream
+  RadioFoundry build. It is not published anywhere; it only has to run on the one machine doing the capture.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>EP capture</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    color-scheme: light dark;
+    --fg: #1b1f23; --bg: #ffffff; --muted: #6a737d; --border: #d0d7de;
+    --accent: #0969da; --ok: #1a7f37; --bad: #cf222e; --warn: #9a6700;
+    --mono: ui-monospace, "SF Mono", Consolas, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg: #e6edf3; --bg: #0d1117; --muted: #8b949e; --border: #30363d; --accent: #4493f8; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0 auto; max-width: 880px; padding: 1.5rem 1rem 4rem;
+    font: 15px/1.45 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--fg); background: var(--bg);
+  }
+  h1 { font-size: 1.4rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1.05rem; margin: 2rem 0 .5rem; }
+  p.lede { color: var(--muted); margin-top: 0; }
+  .card {
+    border: 1px solid var(--border); border-radius: 10px; padding: 1rem 1.1rem; margin: 1rem 0;
+  }
+  button {
+    font: inherit; padding: .5rem 1rem; border-radius: 7px; border: 1px solid var(--border);
+    background: var(--accent); color: #fff; cursor: pointer;
+  }
+  button.secondary { background: transparent; color: var(--fg); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button + button { margin-left: .5rem; }
+  .row { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+  .pill {
+    display: inline-block; padding: .1rem .55rem; border-radius: 999px; font-size: .85rem;
+    border: 1px solid var(--border); color: var(--muted);
+  }
+  .pill.on { color: var(--ok); border-color: var(--ok); }
+  .pill.off { color: var(--muted); }
+  .pill.bad { color: var(--bad); border-color: var(--bad); }
+  .stat { font-family: var(--mono); font-size: .9rem; color: var(--muted); }
+  .stat b { color: var(--fg); }
+  table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: .82rem; margin-top: .5rem; }
+  th, td { text-align: left; padding: .3rem .5rem; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  td.hex { white-space: normal; word-break: break-all; }
+  tbody tr:nth-child(even) { background: rgba(127,127,127,.06); }
+  #log { max-height: 320px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; }
+  .note { color: var(--muted); font-size: .9rem; }
+  .steps { margin: 0; padding-left: 1.3rem; }
+  .steps li { margin: .35rem 0; }
+  details > summary { cursor: pointer; color: var(--muted); }
+  code { background: rgba(127,127,127,.15); border-radius: 4px; padding: .1rem .3rem; }
+  #unsupported {
+    display: none; border: 1px solid var(--bad); color: var(--bad); border-radius: 10px; padding: 1rem; margin: 1rem 0;
+  }
+</style>
+</head>
+<body>
+
+<h1>EP capture</h1>
+<p class="lede">Pulls the raw, still-encrypted octets of a call off a RadioFoundry radio running the EP capture build
+  (CONFIG_EP_CAPTURE), so the recipe can be worked out later on another computer. Runs entirely in this tab — nothing
+  is uploaded anywhere.</p>
+
+<div id="unsupported">
+  This browser doesn't support Web Serial, so it can't talk to the radio. Please open this page in
+  <b>Chrome</b> or <b>Edge</b> on a computer (not a phone) instead.
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">1. Connect</h2>
+  <ol class="steps">
+    <li>Plug the radio into this computer with its programming cable, and power it on.</li>
+    <li>Click <b>Connect</b> below and pick the radio's port from the list the browser shows.</li>
+  </ol>
+  <div class="row">
+    <button id="connectBtn">Connect…</button>
+    <button id="disconnectBtn" class="secondary" disabled>Disconnect</button>
+    <span id="connStatus" class="pill off">not connected</span>
+  </div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">2. Capture</h2>
+  <ol class="steps">
+    <li>Click <b>Start capture</b>.</li>
+    <li>Have the encrypted call come in (or key it up) now — this page only sees calls while capture is running.</li>
+    <li>Watch the count go up below. A few PI headers and a few dozen voice bursts is plenty.</li>
+    <li>Click <b>Stop &amp; save</b> and send the file it downloads.</li>
+  </ol>
+  <div class="row">
+    <button id="startBtn" disabled>Start capture</button>
+    <button id="stopBtn" class="secondary" disabled>Stop &amp; save</button>
+    <button id="clearBtn" class="secondary" disabled>Clear</button>
+    <span id="capStatus" class="pill off">off</span>
+    <span id="capStats" class="stat"></span>
+  </div>
+  <p class="note" id="overflowNote" style="display:none;color:var(--warn)">
+    The ring filled up and dropped some frames — the oldest ones are kept, so this is fine as long as you captured
+    a PI header near the start of the call. If the count below looks short, try again from the start of a call.
+  </p>
+  <div id="log">
+    <table>
+      <thead><tr><th>#</th><th>slot</th><th>kind</th><th>crc</th><th>bytes</th></tr></thead>
+      <tbody id="logBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<details class="card">
+  <summary>Advanced: quick keystream check (optional, for whoever analyzes the capture)</summary>
+  <p class="note">This does <i>not</i> decrypt anything by itself — the exact recipe (how the key and the IV combine,
+    how many keystream bytes are discarded, and where the IV sits in the voice bits) is what the capture is for
+    figuring out. This just runs RC4 for you against a captured entry's raw bytes at a few candidate starting
+    offsets, so someone comparing it against known-clear reference bytes doesn't have to do the XOR by hand.</p>
+  <div class="row">
+    <label>Key (hex, e.g. a 10-digit phone number as digits, or raw hex octets)</label>
+  </div>
+  <div class="row">
+    <input id="keyInput" type="text" placeholder="e.g. 5551234567 or 0102030405" style="font-family:var(--mono);flex:1;min-width:14rem;padding:.4rem">
+    <select id="entryPicker" style="padding:.4rem"></select>
+    <button id="tryKeyBtn" class="secondary">Try it</button>
+  </div>
+  <pre id="keyOut" class="stat" style="white-space:pre-wrap;margin-top:.5rem"></pre>
+</details>
+
+<p class="note">Private tool for a private build — this page isn't part of the regular RadioFoundry firmware or
+  site, and the capture ring only exists in a firmware image someone built with CONFIG_EP_CAPTURE turned on.</p>
+
+<script>
+'use strict';
+
+// ---- debug link framing (docs/spec/debuglink.md section 2) ----
+const SOF1 = 0xA5, SOF2 = 0x5A;
+function crc16(bytes) {
+  let crc = 0xFFFF;
+  for (const b of bytes) {
+    crc ^= (b << 8);
+    for (let i = 0; i < 8; i++) {
+      crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) & 0xFFFF : (crc << 1) & 0xFFFF;
+    }
+  }
+  return crc;
+}
+function buildFrame(cmd, seq, payload) {
+  const len = payload.length;
+  const head = new Uint8Array([SOF1, SOF2, cmd, seq, len & 0xFF, (len >> 8) & 0xFF]);
+  const body = new Uint8Array(head.length - 2 + payload.length); // cmd..payload, for the CRC
+  body.set(head.subarray(2), 0);
+  body.set(payload, head.length - 2);
+  const crc = crc16(body);
+  const frame = new Uint8Array(head.length + payload.length + 2);
+  frame.set(head, 0);
+  frame.set(payload, head.length);
+  frame[frame.length - 2] = crc & 0xFF;
+  frame[frame.length - 1] = (crc >> 8) & 0xFF;
+  return frame;
+}
+
+// EP_CAPTURE command and ops (core/debuglink/debuglink_proto.h)
+const DL_CMD_EP_CAPTURE = 0x21;
+const EP_OP_INFO = 0, EP_OP_ENABLE = 1, EP_OP_DRAIN = 2, EP_OP_RESET = 3;
+const EP_ENTRY_HDR = 7;
+const DL_ST_OK = 0;
+
+// ---- serial link: a tiny frame parser fed by a byte stream, requests matched by sequence number ----
+class DebugLink {
+  constructor() {
+    this.port = null;
+    this.writer = null;
+    this.reader = null;
+    this.seq = 1;
+    this.pending = new Map();
+    this.buf = new Uint8Array(0);
+    this.readLoop = null;
+  }
+  async connect() {
+    this.port = await navigator.serial.requestPort();
+    await this.port.open({ baudRate: 115200 });
+    this.writer = this.port.writable.getWriter();
+    this.reader = this.port.readable.getReader();
+    this.readLoop = this._readLoop();
+  }
+  async disconnect() {
+    try { await this.reader?.cancel(); } catch (e) { /* already closing */ }
+    try { await this.readLoop; } catch (e) { /* loop exit */ }
+    try { this.writer?.releaseLock(); } catch (e) { /* ignore */ }
+    try { this.reader?.releaseLock(); } catch (e) { /* ignore */ }
+    try { await this.port?.close(); } catch (e) { /* ignore */ }
+    this.port = this.writer = this.reader = null;
+    for (const p of this.pending.values()) p.reject(new Error('disconnected'));
+    this.pending.clear();
+  }
+  async _readLoop() {
+    try {
+      for (;;) {
+        const { value, done } = await this.reader.read();
+        if (done) break;
+        if (value && value.length) this._feed(value);
+      }
+    } catch (e) {
+      // port went away or was cancelled; requests in flight time out on their own
+    }
+  }
+  _feed(chunk) {
+    const merged = new Uint8Array(this.buf.length + chunk.length);
+    merged.set(this.buf, 0);
+    merged.set(chunk, this.buf.length);
+    this.buf = merged;
+    for (;;) {
+      const sof = this._findSof();
+      if (sof < 0) { if (this.buf.length > 1) this.buf = this.buf.subarray(this.buf.length - 1); return; }
+      if (sof > 0) this.buf = this.buf.subarray(sof);
+      if (this.buf.length < 6) return;
+      const len = this.buf[4] | (this.buf[5] << 8);
+      const total = 6 + len + 2;
+      if (this.buf.length < total) return;
+      const frame = this.buf.subarray(0, total);
+      this.buf = this.buf.subarray(total);
+      this._handleFrame(frame);
+    }
+  }
+  _findSof() {
+    for (let i = 0; i < this.buf.length - 1; i++) {
+      if (this.buf[i] === SOF1 && this.buf[i + 1] === SOF2) return i;
+    }
+    return this.buf.length > 0 && this.buf[this.buf.length - 1] === SOF1 ? this.buf.length - 1 : -1;
+  }
+  _handleFrame(frame) {
+    const cmd = frame[2], seq = frame[3];
+    const len = frame[4] | (frame[5] << 8);
+    const payload = frame.subarray(6, 6 + len);
+    const key = `${cmd}:${seq}`;
+    const p = this.pending.get(key);
+    if (p) { this.pending.delete(key); p.resolve(payload); }
+  }
+  async request(cmd, payload = new Uint8Array(0), timeoutMs = 1500) {
+    const seq = this.seq = (this.seq + 1) & 0xFF;
+    const frame = buildFrame(cmd, seq, payload);
+    const replyCmd = cmd | 0x80;
+    const key = `${replyCmd}:${seq}`;
+    const promise = new Promise((resolve, reject) => {
+      this.pending.set(key, { resolve, reject });
+      setTimeout(() => {
+        if (this.pending.has(key)) { this.pending.delete(key); reject(new Error('timed out')); }
+      }, timeoutMs);
+    });
+    await this.writer.write(frame);
+    const reply = await promise;
+    if (reply.length < 1) throw new Error('empty reply');
+    return { status: reply[0], payload: reply.subarray(1) };
+  }
+}
+
+// ---- EP capture helpers ----
+function u16(b, o) { return b[o] | (b[o + 1] << 8); }
+function u32(b, o) { return (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)) >>> 0; }
+
+async function epInfo(link) {
+  const { status, payload } = await link.request(DL_CMD_EP_CAPTURE, new Uint8Array([EP_OP_INFO]));
+  if (status !== DL_ST_OK) throw new Error('EP_CAPTURE INFO status ' + status);
+  return { enabled: payload[0] !== 0, count: u16(payload, 1), overflow: u16(payload, 3), capacity: u16(payload, 5) };
+}
+async function epEnable(link, on) {
+  const { status } = await link.request(DL_CMD_EP_CAPTURE, new Uint8Array([EP_OP_ENABLE, on ? 1 : 0]));
+  if (status !== DL_ST_OK) throw new Error('EP_CAPTURE ENABLE status ' + status);
+}
+async function epDrain(link, max = 30) {
+  const { status, payload } = await link.request(DL_CMD_EP_CAPTURE, new Uint8Array([EP_OP_DRAIN, max]));
+  if (status !== DL_ST_OK) throw new Error('EP_CAPTURE DRAIN status ' + status);
+  const n = payload[0];
+  const out = [];
+  let off = 1;
+  for (let i = 0; i < n; i++) {
+    const slot = u32(payload, off);
+    const voiceIndex = payload[off + 4];
+    const crcOk = payload[off + 5] !== 0;
+    const len = payload[off + 6];
+    off += EP_ENTRY_HDR;
+    const data = payload.subarray(off, off + len);
+    out.push({ slot, voiceIndex, crcOk, data: Array.from(data) });
+    off += len;
+  }
+  return out;
+}
+
+// ---- RC4 (for the "advanced" panel only) ----
+function rc4Keystream(key, n, skip = 0) {
+  const s = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) s[i] = i;
+  let j = 0;
+  for (let i = 0; i < 256; i++) {
+    j = (j + s[i] + key[i % key.length]) & 0xFF;
+    [s[i], s[j]] = [s[j], s[i]];
+  }
+  let i = 0; j = 0;
+  const out = new Uint8Array(n);
+  let produced = 0, total = skip + n;
+  for (let k = 0; k < total; k++) {
+    i = (i + 1) & 0xFF;
+    j = (j + s[i]) & 0xFF;
+    [s[i], s[j]] = [s[j], s[i]];
+    if (k >= skip) out[produced++] = s[(s[i] + s[j]) & 0xFF];
+  }
+  return out;
+}
+function hex(bytes) { return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join(' '); }
+
+// ---- UI wiring ----
+const link = new DebugLink();
+let captures = [];
+let polling = null;
+
+const el = (id) => document.getElementById(id);
+const connStatus = el('connStatus'), capStatus = el('capStatus'), capStats = el('capStats');
+const logBody = el('logBody'), overflowNote = el('overflowNote');
+
+if (!('serial' in navigator)) {
+  el('unsupported').style.display = 'block';
+  for (const id of ['connectBtn', 'startBtn']) el(id).disabled = true;
+}
+
+function setConnected(on) {
+  connStatus.textContent = on ? 'connected' : 'not connected';
+  connStatus.className = 'pill ' + (on ? 'on' : 'off');
+  el('connectBtn').disabled = on;
+  el('disconnectBtn').disabled = !on;
+  el('startBtn').disabled = !on;
+  if (!on) { el('stopBtn').disabled = true; el('clearBtn').disabled = captures.length === 0; }
+}
+
+function renderLog() {
+  logBody.innerHTML = '';
+  captures.forEach((e, i) => {
+    const tr = document.createElement('tr');
+    const kind = e.voiceIndex === 0xFF ? 'PI header' : 'voice ' + 'ABCDEF'[e.voiceIndex] || ('voice ' + e.voiceIndex);
+    tr.innerHTML = `<td>${i + 1}</td><td>${e.slot}</td><td>${kind}</td>` +
+      `<td style="color:${e.crcOk ? 'var(--ok)' : 'var(--bad)'}">${e.crcOk ? 'ok' : 'bad'}</td>` +
+      `<td class="hex">${hex(e.data)}</td>`;
+    logBody.appendChild(tr);
+  });
+  el('log').scrollTop = el('log').scrollHeight;
+  capStats.innerHTML = `captured <b>${captures.length}</b> entries`;
+  refreshEntryPicker();
+}
+
+el('connectBtn').onclick = async () => {
+  try {
+    await link.connect();
+    setConnected(true);
+  } catch (e) {
+    connStatus.textContent = 'connect failed: ' + e.message;
+    connStatus.className = 'pill bad';
+  }
+};
+el('disconnectBtn').onclick = async () => {
+  if (polling) { clearInterval(polling); polling = null; }
+  await link.disconnect();
+  setConnected(false);
+  capStatus.textContent = 'off';
+  capStatus.className = 'pill off';
+};
+
+el('startBtn').onclick = async () => {
+  try {
+    await epEnable(link, true);
+    captures = [];
+    renderLog();
+    capStatus.textContent = 'capturing…';
+    capStatus.className = 'pill on';
+    el('startBtn').disabled = true;
+    el('stopBtn').disabled = false;
+    el('clearBtn').disabled = true;
+    overflowNote.style.display = 'none';
+    polling = setInterval(async () => {
+      try {
+        const info = await epInfo(link);
+        if (info.overflow > 0) overflowNote.style.display = 'block';
+        if (info.count > 0) {
+          const batch = await epDrain(link, 30);
+          captures.push(...batch);
+          renderLog();
+        }
+      } catch (e) {
+        // a missed poll isn't fatal; the next one picks up where this left off
+      }
+    }, 400);
+  } catch (e) {
+    capStatus.textContent = 'failed: ' + e.message;
+    capStatus.className = 'pill bad';
+  }
+};
+
+el('stopBtn').onclick = async () => {
+  if (polling) { clearInterval(polling); polling = null; }
+  try {
+    // one last drain in case something arrived between the last poll and now
+    const batch = await epDrain(link, 30);
+    captures.push(...batch);
+  } catch (e) { /* best effort */ }
+  try { await epEnable(link, false); } catch (e) { /* best effort */ }
+  renderLog();
+  capStatus.textContent = 'stopped';
+  capStatus.className = 'pill off';
+  el('startBtn').disabled = false;
+  el('stopBtn').disabled = true;
+  el('clearBtn').disabled = captures.length === 0;
+  saveCapture();
+};
+
+el('clearBtn').onclick = () => {
+  captures = [];
+  renderLog();
+  el('clearBtn').disabled = true;
+};
+
+function saveCapture() {
+  if (captures.length === 0) return;
+  const out = {
+    tool: 'ep-capture.html',
+    savedAt: new Date().toISOString(),
+    entries: captures.map(e => ({ slot: e.slot, voiceIndex: e.voiceIndex, crcOk: e.crcOk, hex: hex(e.data).replace(/ /g, '') })),
+  };
+  const blob = new Blob([JSON.stringify(out, null, 1)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `ep-capture-${out.savedAt.replace(/[:.]/g, '-')}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+function refreshEntryPicker() {
+  const sel = el('entryPicker');
+  const prev = sel.value;
+  sel.innerHTML = '';
+  captures.forEach((e, i) => {
+    const kind = e.voiceIndex === 0xFF ? 'PI' : 'v' + e.voiceIndex;
+    const opt = document.createElement('option');
+    opt.value = i;
+    opt.textContent = `#${i + 1} slot=${e.slot} ${kind} (${e.data.length}B)`;
+    sel.appendChild(opt);
+  });
+  if (prev) sel.value = prev;
+}
+
+el('tryKeyBtn').onclick = () => {
+  const raw = el('keyInput').value.trim();
+  const idx = Number(el('entryPicker').value);
+  const out = el('keyOut');
+  if (!raw || Number.isNaN(idx) || !captures[idx]) {
+    out.textContent = 'Pick a key and a captured entry first.';
+    return;
+  }
+  // digits-only input (a phone number): take each digit as one byte of a decimal-coded key, the simplest reading
+  // of "the key is a phone number" until the real recipe is confirmed against a capture
+  let key;
+  if (/^[0-9]+$/.test(raw)) {
+    key = Uint8Array.from(raw, (c) => c.charCodeAt(0) - 48);
+  } else {
+    const clean = raw.replace(/[^0-9a-fA-F]/g, '');
+    key = new Uint8Array(clean.match(/.{1,2}/g).map((b) => parseInt(b, 16)));
+  }
+  const entry = captures[idx];
+  const data = Uint8Array.from(entry.data);
+  const lines = [`key bytes: ${hex(key)}`, ''];
+  for (const skip of [0, 256]) {
+    const ks = rc4Keystream(key, data.length, skip);
+    const xored = data.map((b, i) => b ^ ks[i]);
+    lines.push(`skip ${skip}:`);
+    lines.push(`  keystream: ${hex(ks)}`);
+    lines.push(`  data ^ ks: ${hex(xored)}`);
+  }
+  lines.push('', 'This is a raw XOR against the captured bytes as they came off the air (before any FEC decode). ' +
+    'The real scheme likely applies the keystream after FEC decode, to the 49 AMBE parameter bits, not to these ' +
+    '27 raw octets directly — so don\'t expect this to come out clean. It\'s a starting point for someone working ' +
+    'out the bit-level recipe on a full computer, not an answer.');
+  out.textContent = lines.join('\n');
+};
+</script>
+</body>
+</html>

@@ -213,6 +213,12 @@ CONFIG_BCAST_FM ?= y
 # levels, for the USB audio feasibility tests on the bench (docs/spec/hardware-dm1701.md 21.3; needs DEBUGLINK and DMR, whose
 # PCM stream it borrows). A diagnostic, never for a release
 CONFIG_AUDIO_PROBE ?= n
+# EP capture ring: debug link command 0x21, a small buffer of the raw octets of encrypted DMR calls (PI headers and
+# still-scrambled voice bursts) for working out a privacy scheme's recipe off the air (needs DEBUGLINK and DMR). A
+# bench diagnostic for the person's own radio, off by default: the ring holds another party's encrypted call
+CONFIG_EP_CAPTURE ?= n
+# the EP capture ring's depth in entries (~34 bytes each); see CONFIG_EP_CAPTURE
+CONFIG_EP_CAPTURE_DEPTH ?= 24
 # runtime RAM-monitor entry: command 0x1A on the host port loads the host's flash-access stub into free RAM and jumps
 # to it without a power cycle, so updates need no key combo at power-on (the web flasher, stub/stubtool.py, rfoundry;
 # core/stubentry, docs/spec/stub-entry.md). Its own feature: with the debug link off it answers on its own small
@@ -258,7 +264,7 @@ CONFIG_APRS_IGATE ?= $(if $(and $(filter y,$(CONFIG_APRS_RX)),$(filter y,$(CONFI
 CONFIG_GPS_SKY ?= $(if $(and $(filter y,$(CONFIG_GPS)),$(filter y,$(CONFIG_APRS))),y,n)
 
 
-FEATURES := FM SUBTONE DMR DMR_PRIVACY DMR_TALKER_ALIAS DMR_GPS DMR_SMS DMR_TMS DMR_ARS DMR_LRRP DMR_SIGNALING DMR_EMERGENCY DMR_ROAMING DMR_IP_GATEWAY ZONE_SHARE DMR_UDP_COMPRESS NET_TCP NET_KISS NET_HTTP NET_HTTP_GZIP NET_WEBCTL NET_RIGCTL NET_APRSIS NET_USRP MDNS TFTP TFTP_IDDB IDDB_COMPACT DMR_CONTROL_STATION SNMP SFR SFR_DUALPATH_RX SFR_CWID TASK_STACKS \
+FEATURES := FM SUBTONE DMR DMR_PRIVACY DMR_TALKER_ALIAS DMR_GPS DMR_SMS DMR_TMS DMR_ARS DMR_LRRP DMR_SIGNALING DMR_EMERGENCY DMR_ROAMING DMR_IP_GATEWAY ZONE_SHARE DMR_UDP_COMPRESS NET_TCP NET_KISS NET_HTTP NET_HTTP_GZIP NET_WEBCTL NET_RIGCTL NET_APRSIS NET_USRP MDNS TFTP TFTP_IDDB IDDB_COMPACT DMR_CONTROL_STATION SNMP SFR SFR_DUALPATH_RX SFR_CWID TASK_STACKS EP_CAPTURE \
 	USB HOSTLINK USB_NETWORK NET_PPP HOTSPOT HOTSPOT_SPLIT DEBUGLINK CPS_OPENFW CPS_FAST VFO VFO_FM VFO_DMR DIAG FONT_XL FONT_AA FONT_BIG LANG_ES LANG_IT LANG_DEFAULT_ES LANG_DEFAULT_IT UI_COLOR UI_SETTINGS SCAN DUAL_WATCH BEEP FM_TX_TONES DTMF \
 	VOX REF_TRIM BATTERY_SAVE VIBRATE GPS AUDIO_PROBE STUB_ENTRY NAND_STORAGE CRASH_LOG CRASH_SCREEN CRASH_REPORT WATCHDOG FAULT_TRACE AM_RX BCAST_FM APRS APRS_RX APRS_IGATE GPS_SKY KEY_ASSIGN CHANNEL_LIST CHANNEL_EDIT ZONE_EDIT CONTACT_EDIT
 
@@ -396,6 +402,12 @@ ifneq ($(call feature_on,AUDIO_PROBE),)
     $(error CONFIG_AUDIO_PROBE=y needs CONFIG_DEBUGLINK=y and CONFIG_DMR=y)
   endif
 endif
+ifneq ($(call feature_on,EP_CAPTURE),)
+  ifeq ($(call feature_on,DEBUGLINK)$(call feature_on,DMR),yy)
+  else
+    $(error CONFIG_EP_CAPTURE=y needs CONFIG_DEBUGLINK=y and CONFIG_DMR=y)
+  endif
+endif
 ifneq ($(call feature_on,STUB_ENTRY),)
   ifeq ($(call feature_on,HOSTLINK),)
     $(error CONFIG_STUB_ENTRY=y needs CONFIG_HOSTLINK=y)
@@ -452,5 +464,5 @@ CONFIG_DMR_AIR_QUEUE_BYTES ?= 2048
 # ours ended, cause not yet known; packets to the same destination go in one transmission instead, with no gap
 CONFIG_DMR_DATA_TX_GUARD_MS ?= 250
 VALUES := DISPLAY_INSET_TOP DISPLAY_INSET_BOTTOM DISPLAY_INSET_LEFT DISPLAY_INSET_RIGHT DMR_AIR_QUEUE_BYTES \
-	  DMR_DATA_TX_GUARD_MS
+	  DMR_DATA_TX_GUARD_MS EP_CAPTURE_DEPTH
 FEATURE_DEFS += $(foreach v,$(VALUES),-DCONFIG_$(v)=$(strip $(CONFIG_$(v))))

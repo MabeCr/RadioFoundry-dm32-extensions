@@ -454,3 +454,7 @@ source = ["tools/rfoundry/rfoundry"]
 [feature.audio_probe]
 switch = "AUDIO_PROBE"
 spec = "docs/spec/usb-audio.md"
+
+[feature.ep_capture]
+switch = "EP_CAPTURE"
+spec = "docs/spec/debuglink.md"

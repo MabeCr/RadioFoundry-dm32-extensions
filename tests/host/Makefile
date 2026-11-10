@@ -27,6 +27,7 @@ FRAME   := $(CORE)/hotspot/dmrDataFrame.c $(CORE)/dmr/fec/dmrFec.c
 TSHARK  ?= $(firstword $(wildcard /Applications/Wireshark*.app/Contents/MacOS/tshark) $(shell command -v tshark))
 
 TESTS   := dmrFecTest sfrTest dmrDataTest dmrDataServiceTest hotspotDataTest hotspotUplinkTest dmrPrivacyTest dmrRc4Test \
+           epCaptureTest \
            ipGatewayTest ipGatewayTest16 ipGatewayTest31 ipGatewayTestShared ipGatewayTestAir440
 
 all: run
@@ -106,6 +107,10 @@ zoneShareTest: zoneShareTest.c fuzz.h $(CORE)/dmr/zoneShare.c $(CORE)/dmr/zoneSh
 dmrRc4Test: dmrRc4Test.c $(CORE)/dmr/dmrRc4.c $(CORE)/dmr/dmrRc4.h
 	$(CC) $(CFLAGS) -o $@ dmrRc4Test.c $(CORE)/dmr/dmrRc4.c
 
+# a small depth (4) so overflow is one extra push away
+epCaptureTest: epCaptureTest.c $(CORE)/dmr/epCapture.c $(CORE)/dmr/epCapture.h
+	$(CC) $(CFLAGS) -I$(ROOT)/hal -DCONFIG_EP_CAPTURE=1 -DCONFIG_EP_CAPTURE_DEPTH=4 -o $@ epCaptureTest.c $(CORE)/dmr/epCapture.c
+
 dmrPrivacyTest: dmrPrivacyTest.c $(CORE)/dmr/dmrPrivacy.c $(CORE)/dmr/dmrPrivacy.h $(CORE)/dmr/ambe/ambeFec.c
 	$(CC) $(CFLAGS) -o $@ dmrPrivacyTest.c $(CORE)/dmr/dmrPrivacy.c $(CORE)/dmr/ambe/ambeFec.c
 
@@ -132,6 +137,7 @@ run: $(TESTS)
 	./hotspotUplinkTest
 	./dmrPrivacyTest
 	./dmrRc4Test
+	./epCaptureTest
 	./lrrpTest
 	./airQueueTest
 	./zoneShareTest

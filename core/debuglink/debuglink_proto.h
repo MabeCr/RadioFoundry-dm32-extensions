@@ -34,6 +34,7 @@ enum {
 	DL_CMD_RX2		= 0x1E,	// the second receiver's SoC: state, the update bridge, restart (debuglink_rx2.c, 3.22)
 	DL_CMD_IDDB		= 0x1F,	// the DMR ID database: its format, records and an ID looked up (debuglink_iddb.c, 3.23)
 	DL_CMD_CHIP_REG		= 0x20,	// an RF chip or SoC register read or written (debuglink_chipreg.c, 3.24)
+	DL_CMD_EP_CAPTURE	= 0x21,	// the EP capture ring (CONFIG_EP_CAPTURE; debuglink_ep_capture.c, 3.25)
 };
 
 // DL_CMD_CHIP_REG's chip number for the SoC's own registers (board.system->reg): an address u32 follows, not a page and
@@ -166,5 +167,17 @@ enum {
 	DL_SNMP_F_RF_GAP_S,		// seconds between RF notifications, 0 = 60, else 10-3600
 	DL_SNMP_F_TRAP_PORT,		// the host's notification port, 0 = 162 (RAM only)
 };
+
+// DL_CMD_EP_CAPTURE operations (first payload byte; docs/spec/debuglink.md 3.25)
+enum {
+	DL_EP_OP_INFO = 0,	// -> status, enabled u8, count u16, overflow u16, capacity u16 (all little endian)
+	DL_EP_OP_ENABLE,	// on u8 -> status: turning on or off clears the ring and the overflow counter
+	DL_EP_OP_DRAIN,		// max u8 -> status, count u8, then count entries (DL_EP_ENTRY_* below), oldest first;
+				// drained entries leave the ring
+	DL_EP_OP_RESET,		// -> status: clear the ring and the overflow counter, leave enabled as it was
+};
+// One drained entry: slot u32, voiceIndex u8 (0-5, or 0xFF for a PI header), crcOk u8, len u8, then len octets
+// (10 for a PI header, 27 for a voice burst)
+#define DL_EP_ENTRY_HDR		7u
 
 #endif

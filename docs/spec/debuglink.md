@@ -802,6 +802,34 @@ hook answers unavailable (4).
 
 Writes are logged. `rfoundry_debug.py reg CHIP REG [VALUE] [--page N]`, or `reg soc ADDR [VALUE]` for the SoC.
 
+### 3.25 EP_CAPTURE
+
+A small ring of the raw octets of encrypted DMR calls (CONFIG_EP_CAPTURE, off by default; `core/dmr/epCapture.h`): PI
+headers and the still-scrambled voice bursts of a call this radio can't decrypt, for working out a privacy scheme's
+recipe on a bench computer. The call stack feeds it before any privacy hook runs, whether or not one is configured;
+nothing here depends on CONFIG_DMR_PRIVACY. Capture starts disabled and stays off across a reboot, so it has to be
+turned on each session.
+
+| Op | Request | Reply after the status |
+|---|---|---|
+| INFO (0) | (none) | enabled u8, count u16, overflow u16, capacity u16 |
+| ENABLE (1) | on u8 | (none) |
+| DRAIN (2) | max u8 | count u8, then count entries, oldest first |
+| RESET (3) | (none) | (none) |
+
+ENABLE clears the ring and the overflow counter whichever way it's set, so turning it on starts a fresh capture
+rather than resuming one. DRAIN pops up to `max` entries (fewer if the ring holds less, or if they wouldn't fit the
+reply); drained entries leave the ring. Each entry is `slot u32, voiceIndex u8, crcOk u8, len u8`, then `len` octets:
+10 for a PI header (`voiceIndex` 0xFF), 27 for a voice burst (`voiceIndex` 0-5, A-F). `slot` is the modem's slot
+counter when the burst was heard (0 if the driver keeps none).
+
+The ring holds `CONFIG_EP_CAPTURE_DEPTH` entries (24 by default, about 34 bytes each); a full ring counts the frame
+it had to drop (the oldest frames are kept, since the PI header and the first few bursts usually matter most) in
+`overflow` rather than losing it silently. Needs CONFIG_DEBUGLINK and CONFIG_DMR; without CONFIG_EP_CAPTURE the
+command answers unavailable (4).
+
+`rfoundry_debug.py ep status|on|off|reset|drain [CSVFILE]`.
+
 ## 4. Safety
 
 - PTT: a firmware time-out on every injected PTT (10 s maximum); the host tool refuses longer holds; the radio

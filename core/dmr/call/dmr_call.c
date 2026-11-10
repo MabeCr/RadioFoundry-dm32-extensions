@@ -6,6 +6,7 @@
 #include <string.h>
 #include "dmr/call/dmr_call.h"
 #include "config.h"
+#include "dmr/epCapture.h"
 #if CONFIG_SFR
 #include "dmr/sfr.h"
 #endif
@@ -673,6 +674,10 @@ static void rx_play(const dmr_burst_t *b, uint32_t now, uint32_t slot)
 
 	bool enc = b->pi || (s.view.caller.svc & DMR_SVC_PRIVACY) || s.view.caller.pi_header;
 
+	if (enc) {
+		// Still-scrambled, before any privacy hook: the raw material a capture (CONFIG_EP_CAPTURE) wants (epCapture.h)
+		epCaptureVoice(b->payload, b->voice_index, slot, b->crc_ok);
+	}
 	if (enc && !s.view.caller.encrypted) {
 		s.view.caller.encrypted = true;
 		stats.rx_encrypted_calls++;
@@ -904,7 +909,7 @@ static void rx_embedded(const dmr_burst_t *b, uint32_t now)
 // (cfg.pi_accept), which decides whether it can decrypt the call (the static key schemes need none, MI-based ones
 // do, docs/spec/gotchas.md 6.4). It comes between the voice LC header
 // and burst A, so the call it belongs to is usually running; if not (header missed), it is held for the late entry
-static void rx_pi_header(const dmr_burst_t *b, uint32_t now)
+static void rx_pi_header(const dmr_burst_t *b, uint32_t now, uint32_t slot)
 {
 	bool ok = b->crc_ok;
 
@@ -920,6 +925,7 @@ static void rx_pi_header(const dmr_burst_t *b, uint32_t now)
 	uint8_t data[DMR_PI_BYTES] = { 0 };
 
 	memcpy(data, b->payload, b->len < DMR_PI_BYTES ? b->len : DMR_PI_BYTES);
+	epCapturePi(data, slot, b->crc_ok);
 	if (s.rx == RXC_NONE) {
 		s.pi_pending = true;
 		s.pi_pending_ms = now;
@@ -1079,7 +1085,7 @@ static void rx_burst(const dmr_burst_t *b, uint32_t now, uint32_t slot)
 		if (s.rx != RXC_NONE && b->kind != DMR_BURST_IDLE)
 			s.last_rx_ms = now;
 		if (b->kind == DMR_BURST_PI_HEADER)
-			rx_pi_header(b, now);
+			rx_pi_header(b, now, slot);
 		if (b->kind >= DMR_BURST_CSBK && b->kind <= DMR_BURST_USBD && b->kind != DMR_BURST_IDLE) {
 			s.last_data_ms = now;	// the view shows RX for it (data_receiving)
 			s.data_seen = true;

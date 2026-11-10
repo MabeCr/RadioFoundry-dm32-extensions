@@ -95,6 +95,9 @@ RX2_FLAGS = {1: "present", 2: "up", 4: "bridge", 8: "restart"}
 IDDB = 0x1F                         # the DMR ID database: format, records, an ID looked up (docs/spec/debuglink.md 3.23)
 CHIP_REG = 0x20                     # an RF chip or SoC register read or written (docs/spec/debuglink.md 3.24)
 CHIP_SOC = 0xFF                     # CHIP_REG's chip number for the SoC's own registers
+EP_CAPTURE = 0x21                   # the EP capture ring (CONFIG_EP_CAPTURE; docs/spec/debuglink.md 3.25)
+EP_OP_INFO, EP_OP_ENABLE, EP_OP_DRAIN, EP_OP_RESET = range(4)
+EP_ENTRY_HDR = 7                    # slot u32, voiceIndex u8, crcOk u8, len u8, then len payload bytes
 SNMP = 0x19                         # the SNMP agent (CONFIG_SNMP; docs/spec/debuglink.md 3.17, docs/spec/snmp.md)
 SNMP_OP_SET, SNMP_OP_COMMUNITY, SNMP_OP_TEST_TRAP = range(3)
 SNMP_FIELDS = {"flags": 0, "rf_manager": 1, "rf_gap_s": 2, "trap_port": 3}
@@ -401,6 +404,45 @@ class DebugLink:
         sa, ss, ja, js, ca, cs = struct.unpack_from("<6I", r, 2)
         return {"region": REGIONS.get(region, str(region)), "claim_pending": bool(pending),
                 "ranges": {"settings": (sa, ss), "journal": (ja, js), "calibration": (ca, cs)}}
+
+    # ── EP capture (CONFIG_EP_CAPTURE, docs/spec/debuglink.md 3.25) ──
+    def ep_info(self):
+        """(enabled, count, overflow, capacity) of the EP capture ring."""
+        _, r = self.request(EP_CAPTURE, bytes([EP_OP_INFO]))
+        enabled = bool(r[0])
+        count, overflow, capacity = struct.unpack_from("<3H", r, 1)
+        return {"enabled": enabled, "count": count, "overflow": overflow, "capacity": capacity}
+
+    def ep_enable(self, on):
+        """Turn the ring on or off; either way clears it and the overflow counter."""
+        self.request(EP_CAPTURE, bytes([EP_OP_ENABLE, 1 if on else 0]))
+
+    def ep_reset(self):
+        """Clear the ring and the overflow counter without changing whether it's enabled."""
+        self.request(EP_CAPTURE, bytes([EP_OP_RESET]))
+
+    def ep_drain(self, max_entries=30):
+        """Pop up to max_entries from the ring (oldest first); each is {"slot", "voice_index", "crc_ok", "data"}."""
+        _, r = self.request(EP_CAPTURE, bytes([EP_OP_DRAIN, max_entries & 0xFF]))
+        n = r[0]
+        out = []
+        off = 1
+        for _ in range(n):
+            slot, voice_index, crc_ok, length = struct.unpack_from("<IBBB", r, off)
+            off += EP_ENTRY_HDR
+            out.append({"slot": slot, "voice_index": voice_index, "crc_ok": bool(crc_ok),
+                        "data": bytes(r[off:off + length])})
+            off += length
+        return out
+
+    def ep_drain_all(self, max_entries=30):
+        """Repeated ep_drain() calls until the ring reports empty; returns every entry collected."""
+        out = []
+        while True:
+            batch = self.ep_drain(max_entries)
+            if not batch:
+                return out
+            out.extend(batch)
 
     # ── audio probe (CONFIG_AUDIO_PROBE, docs/spec/debuglink.md 3.14) ──
     def probe_status(self):
@@ -1868,6 +1910,34 @@ def cmd_aprobe(link, a):
     return 0
 
 
+def cmd_ep(link, a):
+    args = a.args
+    if a.op == "status":
+        st = link.ep_info()
+        print(f"{'enabled' if st['enabled'] else 'disabled'}, {st['count']}/{st['capacity']} entries, "
+              f"{st['overflow']} dropped for a full ring")
+    elif a.op == "on":
+        link.ep_enable(True)
+        print("capture enabled (ring cleared)")
+    elif a.op == "off":
+        link.ep_enable(False)
+        print("capture disabled (ring cleared)")
+    elif a.op == "reset":
+        link.ep_reset()
+        print("ring cleared")
+    elif a.op == "drain":
+        entries = link.ep_drain_all()
+        for e in entries:
+            kind = "PI  " if e["voice_index"] == 0xFF else f"v{e['voice_index']}"
+            print(f"slot={e['slot']:<10} {kind} crc_ok={int(e['crc_ok'])} {e['data'].hex()}")
+        if args:
+            with open(args[0], "w", encoding="ascii") as f:
+                for e in entries:
+                    f.write(f"{e['slot']},{e['voice_index']},{int(e['crc_ok'])},{e['data'].hex()}\n")
+            print(f"{args[0]}: {len(entries)} entries (slot,voice_index,crc_ok,hex)")
+    return 0
+
+
 def cmd_crash(link, a):
     if a.op == "clear":
         link.crash_clear()
@@ -2146,6 +2216,10 @@ def main(argv=None):
                                      "mod"])
     p.add_argument("args", nargs="*")
     p.add_argument("-o", "--output", help="samples: also write the block as raw 16-bit stereo; ram: the bytes")
+    p = sub.add_parser("ep", help="EP capture ring: status, on, off, reset, drain (CONFIG_EP_CAPTURE builds, "
+                                   "docs/spec/debuglink.md 3.25)")
+    p.add_argument("op", choices=["status", "on", "off", "reset", "drain"])
+    p.add_argument("args", nargs="*", help="drain: an optional CSV path to also save the entries to")
     a = ap.parse_args(argv)
 
     if a.cmd == "ptt" and not 0 < a.seconds <= INJECT_MAX_S:
@@ -2219,6 +2293,8 @@ def main(argv=None):
                     print(f"chip {a.chip} page {a.page} 0x{a.reg:02X} = 0x{v:04X}")
             elif a.cmd == "aprobe":
                 return cmd_aprobe(link, a)
+            elif a.cmd == "ep":
+                return cmd_ep(link, a)
             elif a.cmd == "split":
                 if a.op == "view":
                     for k, v in link.split_view().items():

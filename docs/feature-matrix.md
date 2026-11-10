@@ -134,6 +134,7 @@ is `tools/bringup.py list --radio <id>`.
 | `nand_storage` | ✕ | ✕ | ✕ | not recorded | ✕ | ✕ |
 | `codec_check` | not recorded | not recorded | not recorded | not recorded | not recorded | not recorded |
 | `audio_probe` | not written | off | not written | not written | not written | off |
+| `ep_capture` | off | off | off | off | off | off |
 <!-- end generated -->
 
 What the records don't hold yet: limits and known problems from the bring-up pages.
@@ -197,6 +198,7 @@ clock`; ? = not known yet). No driver reads the clock yet ([radio-features.md](s
 | `SFR_DUALPATH_RX` | ● | ● | ● | ● | ✕ | ● |
 | `SFR_CWID` | ● | ● | ● | ● | ✕ | ● |
 | `TASK_STACKS` | ● | ● | ● | ● | ● | ● |
+| `EP_CAPTURE` | ○ | ○ | ○ | ○ | ○ | ○ |
 | `USB` | ✕ | ● | ✕ | ✕ | ● | ● |
 | `HOSTLINK` | ● | ● | ● | ● | ● | ● |
 | `USB_NETWORK` | ✕ | ● | ✕ | ✕ | ● | ● |
@@ -371,6 +373,7 @@ clock`; ? = not known yet). No driver reads the clock yet ([radio-features.md](s
 | Feature | Switch | Bytes DM-1701 | Bytes MD-380 | Notes |
 |---|---|---:|---:|---|
 | Audio path probe (debug link 0x10) | `AUDIO_PROBE` | 1,176* | — | Bench only, never in a release |
+| EP capture ring (debug link 0x21) | `EP_CAPTURE` | — | — | Bench only, never in a release; off everywhere, not yet measured (needs a CI build on the ARM radios, unlike the other `—` rows above this isn't "not built there") ([debuglink.md](spec/debuglink.md) 3.25) |
 
 ## Whole images
 
