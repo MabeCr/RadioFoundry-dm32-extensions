@@ -134,6 +134,10 @@ endif
 ifeq ($(CONFIG_DMR_PRIVACY),y)
 APP_SRC += core/dmr/dmrPrivacy.c
 endif
+# The EP capture ring (core/debuglink/debuglink_ep_capture.c, globbed with CONFIG_DEBUGLINK, calls into it)
+ifeq ($(CONFIG_EP_CAPTURE),y)
+APP_SRC += core/dmr/epCapture.c
+endif
 # DMR data (SMS, ARS, LRRP, CSBK signaling)
 ifeq ($(CONFIG_DMR_DATA_CORE),y)
 APP_SRC += core/dmr/dmrData.c core/dmr/dmrDataService.c core/dmr/dmrLrrp.c
