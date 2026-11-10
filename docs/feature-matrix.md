@@ -134,7 +134,7 @@ is `tools/bringup.py list --radio <id>`.
 | `nand_storage` | ✕ | ✕ | ✕ | not recorded | ✕ | ✕ |
 | `codec_check` | not recorded | not recorded | not recorded | not recorded | not recorded | not recorded |
 | `audio_probe` | not written | off | not written | not written | not written | off |
-| `ep_capture` | off | off | off | off | off | off |
+| `ep_capture` | not recorded | off | off | off | off | off |
 <!-- end generated -->
 
 What the records don't hold yet: limits and known problems from the bring-up pages.
@@ -198,7 +198,7 @@ clock`; ? = not known yet). No driver reads the clock yet ([radio-features.md](s
 | `SFR_DUALPATH_RX` | ● | ● | ● | ● | ✕ | ● |
 | `SFR_CWID` | ● | ● | ● | ● | ✕ | ● |
 | `TASK_STACKS` | ● | ● | ● | ● | ● | ● |
-| `EP_CAPTURE` | ○ | ○ | ○ | ○ | ○ | ○ |
+| `EP_CAPTURE` | ● | ○ | ○ | ○ | ○ | ○ |
 | `USB` | ✕ | ● | ✕ | ✕ | ● | ● |
 | `HOSTLINK` | ● | ● | ● | ● | ● | ● |
 | `USB_NETWORK` | ✕ | ● | ✕ | ✕ | ● | ● |

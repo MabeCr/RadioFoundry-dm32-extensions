@@ -31,3 +31,6 @@ BOARD_UNSUPPORTED += NAND_STORAGE	# the data flash is SPI NOR, GD25Q128 class (d
 # written, unconfirmed"): off by default, and off in ci's maximal configuration too
 BOARD_NOT_WRITTEN += VOX	# no hal_power_t.mic_level hook yet
 BOARD_NOT_WRITTEN += AUDIO_PROBE	# no board.audio_tap yet
+# One-off: this branch only, never merged into feature/ep-rx. Turns on the EP capture ring (core/dmr/epCapture.h,
+# off everywhere else) so this specific build can be flashed for a capture run, then thrown away
+CONFIG_EP_CAPTURE ?= y
