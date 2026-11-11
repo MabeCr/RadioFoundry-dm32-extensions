@@ -11,7 +11,8 @@
 # channel name; text is anti-aliased, and lists and labels are one size up (9x18)
 CONFIG_FONT_XL ?= y
 CONFIG_FONT_AA ?= y
-CONFIG_FONT_BIG ?= y
+# Follows FONT_AA (config/features.mk: BIG needs AA), so the nightly matrix's "FONT_AA off alone" build is a valid one
+CONFIG_FONT_BIG ?= $(CONFIG_FONT_AA)
 # The bezel hides the panel's edges, in panel pixels: text 6 px from the left or right edge was still clipped on the
 # radio, so 10 px left and right (the 8 px measured on the right leaves no more 8 px columns), 5 px top and bottom
 CONFIG_DISPLAY_INSET_LEFT ?= 10

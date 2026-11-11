@@ -338,6 +338,20 @@ static void reset_tone(radio_sm_t *sm)
 // The APRS job's phases (aprs_phase)
 enum { APRS_RF_OFF = 0, APRS_RF_LISTEN, APRS_RF_KEYUP, APRS_RF_SEND };
 
+#if CONFIG_BCAST_FM
+// Whether a scan or dual watch is running: never in a build without scanning (radio_sm_t has no scan state then).
+// Guarded as its caller is (the broadcast listening state)
+static bool scan_running(const radio_sm_t *sm)
+{
+#if CONFIG_SCAN
+	return scan_on(&sm->scan);
+#else
+	(void)sm;
+	return false;
+#endif
+}
+#endif
+
 // A broadcast station is listened to, not squelched: the state stays RX (so the screen shows the level and the LED is on)
 // whatever the signal, and the audio plays. A scan keeps the squelch to stop on stations
 static bool bcast_listening(const radio_sm_t *sm)
@@ -347,7 +361,7 @@ static bool bcast_listening(const radio_sm_t *sm)
 #if CONFIG_APRS
 	own_rx = sm->aprs_phase == APRS_RF_OFF;
 #endif
-	return own_rx && sm->view.bcast && !sm->view.bcast_fault && !scan_on(&sm->scan);
+	return own_rx && sm->view.bcast && !sm->view.bcast_fault && !scan_running(sm);
 #else
 	(void)sm;
 	return false;
