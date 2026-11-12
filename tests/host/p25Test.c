@@ -13,6 +13,7 @@
 #include "p25/p25.h"
 #include "p25/p25_rx.h"
 #include "p25/p25_block.h"
+#include "p25/p25_tsbk.h"
 
 static int failures = 0;
 
@@ -410,12 +411,96 @@ static void test_tsbk_rx(void)
 	CHECK(good >= 20 * 6 * 70 / 100, "noisy blocks %u/120", good);
 }
 
+// --- messages (field layouts and the example vectors are from p25.rs's tests, MIT) ---
+
+static void msg_of(const uint8_t b[12], p25_msg_t *m)
+{
+	p25_tsbk_t t = { .lb = b[0] >> 7, .protect = (b[0] >> 6) & 1, .opcode = b[0] & 0x3F, .mfid = b[1], .crc_ok = 1 };
+
+	memcpy(t.args, b + 2, 8);
+	p25_msg_parse(&t, m);
+}
+
+static void test_msg(void)
+{
+	p25_msg_t m;
+
+	// the standard's channel identifier example: base 851.00625 MHz, 6.25 kHz spacing, -45 MHz, channel 9 = 851.0625 MHz
+	static const uint8_t iden[12] = { 0x3D, 0x00, 0x63, 0x22, 0xD0, 0x32, 0x0A, 0x25, 0x10, 0xA2, 0xFF, 0xFF };
+	p25_iden_table_t tab = { 0 };
+	uint32_t rx, tx;
+
+	msg_of(iden, &m);
+	CHECK(m.kind == P25_MSG_IDEN_UPDATE && m.u.iden.id == 6, "iden kind/id");
+	CHECK(m.u.iden.iden.bandwidth_hz == 12500 && m.u.iden.iden.spacing_hz == 6250 && m.u.iden.iden.base_hz == 851006250 &&
+	      m.u.iden.iden.tx_offset_hz == -45000000, "iden params %u %u %u %d", m.u.iden.iden.bandwidth_hz,
+	      m.u.iden.iden.spacing_hz, m.u.iden.iden.base_hz, m.u.iden.iden.tx_offset_hz);
+	p25_iden_update(&tab, &m);
+	CHECK(!p25_chan_freq(&tab, (p25_chan_t){ 5, 9 }, &rx, &tx), "unknown identifier");
+	CHECK(p25_chan_freq(&tab, (p25_chan_t){ 6, 9 }, &rx, &tx) && rx == 851062500 && tx == 806062500, "channel freq %u %u", rx, tx);
+
+	static const uint8_t grant[12] = { 0x00, 0xFF, 0xA3, 0xE5, 0xCC, 0x18, 0xE7, 0xF0, 0x78, 0x3C, 0, 0 };
+
+	msg_of(grant, &m);
+	CHECK(m.kind == P25_MSG_OTHER, "vendor mfid is not decoded");
+	{
+		uint8_t g[12];
+
+		memcpy(g, grant, 12);
+		g[1] = 0;
+		msg_of(g, &m);
+		CHECK(m.kind == P25_MSG_GRP_VOICE_GRANT && m.u.grp_grant.opts == 0xA3 && m.u.grp_grant.chan.id == 0xE &&
+		      m.u.grp_grant.chan.number == 0x5CC && m.u.grp_grant.tg == 0x18E7 && m.u.grp_grant.src == 0xF0783C,
+		      "group voice grant");
+	}
+	static const uint8_t upd[12] = { 0x02, 0, 0x6F, 0x55, 0xFF, 0xFF, 0x9A, 0xAA, 0x33, 0xCC, 0, 0 };
+
+	msg_of(upd, &m);
+	CHECK(m.kind == P25_MSG_GRP_VOICE_UPDATE && m.u.grp_update.chan[0].id == 6 && m.u.grp_update.chan[0].number == 0xF55 &&
+	      m.u.grp_update.tg[0] == 0xFFFF && m.u.grp_update.chan[1].id == 9 && m.u.grp_update.chan[1].number == 0xAAA &&
+	      m.u.grp_update.tg[1] == 0x33CC, "group voice update");
+	static const uint8_t adj[12] = { 0x3C, 0, 0xCC, 0xDF, 0x3C, 0xAA, 0x55, 0x36, 0x7E, 0x51, 0, 0 };
+
+	msg_of(adj, &m);
+	CHECK(m.kind == P25_MSG_ADJACENT_SITE && m.u.site.area == 0xCC && m.u.site.opts == 0xD && m.u.site.system == 0xF3C &&
+	      m.u.site.rfss == 0xAA && m.u.site.site == 0x55 && m.u.site.chan.id == 3 && m.u.site.chan.number == 0x67E &&
+	      m.u.site.svc == 0x51 && (m.u.site.svc & P25_SVC_DATA) && (m.u.site.svc & P25_SVC_REGISTRATION) &&
+	      (m.u.site.svc & P25_SVC_COMPOSITE) && !(m.u.site.svc & P25_SVC_VOICE), "adjacent site");
+	static const uint8_t net[12] = { 0x3B, 0, 0xCA, 0xFC, 0x2B, 0xCF, 0x5B, 0xDC, 0xE7, 0x51, 0, 0 };
+
+	msg_of(net, &m);
+	CHECK(m.kind == P25_MSG_NETWORK_STATUS && m.u.site.area == 0xCA && m.u.site.wacn == 0xFC2BC && m.u.site.system == 0xF5B &&
+	      m.u.site.chan.id == 0xD && m.u.site.chan.number == 0xCE7, "network status");
+	static const uint8_t reg[12] = { 0x2C, 0, 0xDA, 0xE7, 0xAA, 0x55, 0x33, 0xF8, 0x3F, 0xCC, 0, 0 };
+
+	msg_of(reg, &m);
+	CHECK(m.kind == P25_MSG_UNIT_REG_RESPONSE && m.u.unit_reg.resp == P25_REG_FAIL && m.u.unit_reg.system == 0xAE7 &&
+	      m.u.unit_reg.src_id == 0xAA5533 && m.u.unit_reg.src_addr == 0xF83FCC, "unit registration response");
+	static const uint8_t alt[12] = { 0x39, 0, 0xE3, 0x55, 0xB6, 0xAF, 0x51, 0xEA, 0xAA, 0xAE, 0, 0xFF };
+
+	msg_of(alt, &m);
+	CHECK(m.kind == P25_MSG_ALT_CONTROL_CHANNEL && m.u.alt_cc.rfss == 0xE3 && m.u.alt_cc.site == 0x55 &&
+	      m.u.alt_cc.chan[0].id == 0xB && m.u.alt_cc.chan[0].number == 0x6AF && m.u.alt_cc.svc[0] == 0x51 &&
+	      m.u.alt_cc.chan[1].id == 0xE && m.u.alt_cc.chan[1].number == 0xAAA && m.u.alt_cc.svc[1] == 0xAE, "alternate control channel");
+	// a transmit offset with bit 8 set is above the receive frequency
+	{
+		uint8_t i2[12];
+
+		memcpy(i2, iden, 12);
+		i2[3] |= 0x04;
+		msg_of(i2, &m);
+		p25_iden_update(&tab, &m);
+		CHECK(p25_chan_freq(&tab, (p25_chan_t){ 6, 9 }, &rx, &tx) && rx == 851062500 && tx == 896062500, "positive offset %u", tx);
+	}
+}
+
 int main(void)
 {
 	test_nid_code();
 	test_rx();
 	test_block();
 	test_tsbk_rx();
+	test_msg();
 	if (failures)
 		printf("# FAILED %d\n", failures);
 	else
