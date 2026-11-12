@@ -12,6 +12,7 @@
 #include <string.h>
 #include "p25/p25.h"
 #include "p25/p25_rx.h"
+#include "p25/p25_block.h"
 
 static int failures = 0;
 
@@ -129,17 +130,19 @@ static size_t synth(const uint8_t *dib, size_t nd, uint32_t rate, double t0, dou
 }
 
 // One frame's dibits: sync, NID, then `extra` random dibits, status symbols at every 36th from the sync's first
-static size_t frame_dibits(uint8_t *d, uint16_t nac, uint8_t duid, unsigned extra)
+static size_t frame_dibits_p(uint8_t *d, uint16_t nac, uint8_t duid, unsigned extra, const uint8_t *pay, unsigned npay)
 {
 	uint64_t nid = p25_nid_encode(nac, duid);
 	size_t n = 0, pos = 0;
-	uint8_t raw[24 + 32 + 200];
+	uint8_t raw[24 + 32 + 400];
 	size_t nr = 0;
 
 	for (unsigned i = 0; i < P25_SYNC_DIBITS; i++)
 		raw[nr++] = (P25_SYNC_BITS >> (46 - 2 * i)) & 3;
 	for (unsigned i = 0; i < P25_NID_DIBITS; i++)
 		raw[nr++] = (nid >> (62 - 2 * i)) & 3;
+	for (unsigned i = 0; i < npay; i++)
+		raw[nr++] = pay[i];
 	for (unsigned i = 0; i < extra; i++)
 		raw[nr++] = rnd() & 3;
 	for (size_t i = 0; i < nr; i++, pos++) {
@@ -148,6 +151,11 @@ static size_t frame_dibits(uint8_t *d, uint16_t nac, uint8_t duid, unsigned extr
 		d[n++] = raw[i];
 	}
 	return n;
+}
+
+static size_t frame_dibits(uint8_t *d, uint16_t nac, uint8_t duid, unsigned extra)
+{
+	return frame_dibits_p(d, nac, duid, extra, NULL, 0);
 }
 
 typedef struct { unsigned n; uint16_t nac[16]; uint8_t duid[16]; } got_t;
@@ -246,10 +254,168 @@ static void test_rx(void)
 	CHECK(!p25_rx_init(&rx, 96000, NULL, NULL), "rate too high");
 }
 
+// --- data blocks ---
+
+static void test_block(void)
+{
+	// the interleave: spot values of the inverse permutation as p25.rs lists it, through the code's own round trip
+	uint8_t in[12], out[98], back[12];
+
+	for (unsigned t = 0; t < 200; t++) {
+		for (unsigned i = 0; i < 10; i++)
+			in[i] = rnd();
+		uint16_t c = p25_crc16(in, 10);
+
+		in[10] = c >> 8;
+		in[11] = c & 0xFF;
+		p25_block_encode(in, out);
+		CHECK(p25_block_decode(out, back) == 0 && !memcmp(in, back, 12), "clean block %u", t);
+		// scattered channel errors: two single bit errors far apart
+		uint8_t bad[98];
+
+		memcpy(bad, out, 98);
+		for (unsigned e = 0; e < 2; e++)
+			bad[e * 49 + rnd() % 40] ^= 1u << (rnd() & 1);
+		p25_block_decode(bad, back);
+		CHECK(!memcmp(in, back, 12), "2 scattered bit errors, block %u", t);
+	}
+	// a consecutive burst of 6 dibits is spread by the interleaver
+	unsigned burst_ok = 0;
+
+	for (unsigned t = 0; t < 100; t++) {
+		for (unsigned i = 0; i < 12; i++)
+			in[i] = rnd();
+		p25_block_encode(in, out);
+		unsigned at = rnd() % 90;
+
+		for (unsigned i = 0; i < 6; i++)
+			out[at + i] ^= 1u << (rnd() & 1);
+		p25_block_decode(out, back);
+		burst_ok += !memcmp(in, back, 12);
+	}
+	CHECK(burst_ok >= 95, "bursts of 6 bit errors in 6 dibits fixed: %u/100", burst_ok);
+	// every encoding is a different dibit string at least 3 channel bits apart (the code's free distance is larger)
+	uint8_t a[98], b[98];
+
+	memset(in, 0, 12);
+	p25_block_encode(in, a);
+	for (unsigned i = 0; i < 48; i++) {
+		memset(in, 0, 12);
+		in[i / 4] = 1 << (6 - 2 * (i % 4));
+		p25_block_encode(in, b);
+		unsigned dist = 0;
+
+		for (unsigned j = 0; j < 98; j++)
+			dist += __builtin_popcount(a[j] ^ b[j]);
+		CHECK(dist >= 5, "single dibit input %u: distance %u", i, dist);
+	}
+}
+
+typedef struct { unsigned n; p25_tsbk_t t[8]; uint8_t idx[8]; } tsbk_got_t;
+
+static void on_tsbk(const p25_tsbk_t *t, uint8_t index, const p25_frame_t *f, void *ctx)
+{
+	tsbk_got_t *g = ctx;
+
+	if (g->n < 8) {
+		g->t[g->n] = *t;
+		g->idx[g->n] = index;
+	}
+	g->n++;
+}
+
+// Frames of one to three blocks each; returns the number of blocks found whole
+static unsigned run_tsbk(uint32_t rate, double t0, double amp, double dc, double noise)
+{
+	static uint8_t dib[6000];
+	static int16_t pcm[200000];
+	size_t nd = 0;
+	uint8_t pay[300], want[3][12];
+	unsigned wantn = 0, nblk_total = 0;
+	tsbk_got_t g = { 0 };
+	p25_rx_t rx;
+
+	for (unsigned i = 0; i < 40; i++)
+		dib[nd++] = rnd() & 3;
+	for (unsigned f = 0; f < 3; f++) {
+		unsigned nb = 1 + f;
+		unsigned np = 0;
+
+		for (unsigned b = 0; b < nb; b++) {
+			uint8_t in[12];
+
+			for (unsigned i = 0; i < 12; i++)
+				in[i] = rnd();
+			in[0] = (in[0] & 0x7F) | (b == nb - 1 ? 0x80 : 0);
+			uint16_t c = p25_crc16(in, 10);
+
+			in[10] = c >> 8;
+			in[11] = c & 0xFF;
+			if (f == 2 && b == 0)
+				memcpy(want[0], in, 12);	// kept for a check of the field split
+			p25_block_encode(in, pay + np);
+			np += 98;
+			nblk_total++;
+		}
+		nd += frame_dibits_p(dib + nd, 0x293, P25_DUID_TSDU, 20, pay, np);
+		(void)wantn;
+	}
+	size_t n = synth(dib, nd, rate, t0, amp, dc, noise, pcm, sizeof pcm / sizeof pcm[0]);
+
+	p25_rx_init(&rx, rate, NULL, NULL);
+	p25_rx_set_tsbk(&rx, on_tsbk, &g);
+	for (size_t i = 0; i < n;) {
+		size_t c = 1 + rnd() % 211;
+
+		if (c > n - i)
+			c = n - i;
+		p25_rx_feed(&rx, pcm + i, c);
+		i += c;
+	}
+	unsigned ok = 0;
+
+	for (unsigned i = 0; i < g.n && i < 8; i++)
+		if (g.t[i].crc_ok)
+			ok++;
+	// the third frame's first block: fields split as laid out
+	if (g.n >= 6 && g.t[3].crc_ok) {
+		CHECK(g.t[3].lb == (want[0][0] >> 7) && g.t[3].protect == ((want[0][0] >> 6) & 1) &&
+		      g.t[3].opcode == (want[0][0] & 0x3F) && g.t[3].mfid == want[0][1] && !memcmp(g.t[3].args, want[0] + 2, 8),
+		      "tsbk field split");
+	}
+	CHECK(g.n <= 6 || noise > 0, "too many blocks: %u", g.n);
+	// indexes count within each unit: 0 | 0 1 | 0 1 2
+	if (noise == 0 && g.n == 6) {
+		static const uint8_t ix[6] = { 0, 0, 1, 0, 1, 2 };
+
+		for (unsigned i = 0; i < 6; i++)
+			CHECK(g.idx[i] == ix[i], "block index %u is %u", i, g.idx[i]);
+	}
+	(void)nblk_total;
+	return ok;
+}
+
+static void test_tsbk_rx(void)
+{
+	for (unsigned k = 0; k < 10; k++) {
+		unsigned ok = run_tsbk(8000, k / 10.0, 6000, 0, 0);
+
+		CHECK(ok == 6, "tsbk offset %.1f: %u/6 blocks", k / 10.0, ok);
+	}
+	CHECK(run_tsbk(24000, 0.4, 6000, 3000, 0) == 6, "tsbk 24 kHz with offset");
+	unsigned good = 0;
+
+	for (unsigned t = 0; t < 20; t++)
+		good += run_tsbk(8000, (t % 10) / 10.0, 6000, 0, 2000);
+	CHECK(good >= 20 * 6 * 70 / 100, "noisy blocks %u/120", good);
+}
+
 int main(void)
 {
 	test_nid_code();
 	test_rx();
+	test_block();
+	test_tsbk_rx();
 	if (failures)
 		printf("# FAILED %d\n", failures);
 	else

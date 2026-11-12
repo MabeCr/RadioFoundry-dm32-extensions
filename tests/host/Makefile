@@ -568,11 +568,11 @@ run-ambe: ambeFecTest ambeVoiceTest micGainTest refTrimTest
 	./refTrimTest
 .PHONY: run-ambe
 
-# The P25 Phase 1 receiver core (core/p25): NID code and the sync / NID front end on synthetic C4FM
+# The P25 Phase 1 receiver core (core/p25): NID code, data block coding and the sync / NID / TSBK front end on synthetic C4FM
 TESTS   += p25Test
 
-p25Test: p25Test.c $(CORE)/p25/p25.c $(CORE)/p25/p25_rx.c $(wildcard $(CORE)/p25/*.h)
-	$(CC) $(CFLAGS) -Wshadow -o $@ p25Test.c $(CORE)/p25/p25.c $(CORE)/p25/p25_rx.c -lm
+p25Test: p25Test.c $(wildcard $(CORE)/p25/*.c $(CORE)/p25/*.h)
+	$(CC) $(CFLAGS) -Wshadow -o $@ p25Test.c $(wildcard $(CORE)/p25/*.c) -lm
 
 run: run-p25
 run-p25: p25Test

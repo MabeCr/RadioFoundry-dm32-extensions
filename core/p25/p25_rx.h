@@ -11,6 +11,7 @@
 
 #include <stddef.h>
 #include "p25/p25.h"
+#include "p25/p25_block.h"
 
 #define P25_RX_PHASES		8u
 
@@ -23,6 +24,8 @@ typedef struct {
 } p25_frame_t;
 
 typedef void (*p25_frame_fn)(const p25_frame_t *f, void *ctx);
+// One TSBK of a trunking signaling data unit, `index` counting from 0 within the unit
+typedef void (*p25_tsbk_fn)(const p25_tsbk_t *t, uint8_t index, const p25_frame_t *f, void *ctx);
 
 typedef struct {
 	uint32_t rate;
@@ -37,16 +40,25 @@ typedef struct {
 	uint8_t phase;
 	int16_t dc, amp;
 	uint16_t score_q8;
-	uint8_t got;
+	uint16_t got;		// dibits after the sync, status symbols included
+	uint8_t nid_n;
 	uint64_t nid;
+	bool in_blocks;		// the NID said TSDU: collecting 98-dibit blocks
+	uint8_t blk_n, blk_idx;
+	uint8_t blk[P25_BLOCK_DIBITS];
+	p25_frame_t cur;
 	p25_frame_fn fn;
 	void *ctx;
-	uint32_t syncs, nid_ok, nid_bad;
+	p25_tsbk_fn tsbk_fn;
+	void *tsbk_ctx;
+	uint32_t syncs, nid_ok, nid_bad, tsbk_ok, tsbk_bad;
 	uint32_t duid[16];	// frames by DUID
 } p25_rx_t;
 
 // False when the rate can't be handled (outside 7200..48000 Hz)
 bool p25_rx_init(p25_rx_t *r, uint32_t rate, p25_frame_fn fn, void *ctx);
+// Also decode the blocks of trunking signaling data units (a TSDU holds one to three)
+void p25_rx_set_tsbk(p25_rx_t *r, p25_tsbk_fn fn, void *ctx);
 void p25_rx_feed(p25_rx_t *r, const int16_t *s, size_t n);
 
 #endif

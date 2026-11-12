@@ -102,28 +102,52 @@ static void symbol_period(p25_rx_t *r)
 
 	if (r->locked) {
 		uint8_t d = slice(r->hist[r->phase][(r->k - 1) & 31], r->dc, r->amp);
+		unsigned pos = P25_SYNC_DIBITS + r->got++;	// the dibit's place in the frame, from the sync's first
 
-		// the 36th dibit from the sync's first is a status symbol: dibit 35 is NID dibit 11 + 24 sync dibits
-		if (r->got != P25_STATUS_EVERY - P25_SYNC_DIBITS - 1) {
+		if (pos % P25_STATUS_EVERY == P25_STATUS_EVERY - 1)
+			return;		// a status symbol, not part of the data
+		if (!r->in_blocks) {
 			r->nid = (r->nid << 2) | d;
-		}
-		r->got++;
-		if (r->got == P25_NID_DIBITS + 1) {
-			p25_frame_t f;
+			if (++r->nid_n < P25_NID_DIBITS)
+				return;
+			p25_frame_t *f = &r->cur;
 
 			r->locked = false;
-			if (p25_nid_decode(r->nid, &f.nid)) {
-				r->nid_ok++;
-				r->duid[f.nid.duid]++;
-				f.sample = r->n;
-				f.score_q8 = r->score_q8;
-				f.dc = r->dc;
-				f.amp = (uint16_t)r->amp;
-				if (r->fn)
-					r->fn(&f, r->ctx);
-			} else {
+			if (!p25_nid_decode(r->nid, &f->nid)) {
 				r->nid_bad++;
+				return;
 			}
+			r->nid_ok++;
+			r->duid[f->nid.duid]++;
+			f->sample = r->n;
+			f->score_q8 = r->score_q8;
+			f->dc = r->dc;
+			f->amp = (uint16_t)r->amp;
+			if (r->fn)
+				r->fn(f, r->ctx);
+			if (f->nid.duid == P25_DUID_TSDU && r->tsbk_fn) {
+				r->locked = true;
+				r->in_blocks = true;
+				r->blk_n = 0;
+				r->blk_idx = 0;
+			}
+			return;
+		}
+		r->blk[r->blk_n++] = d;
+		if (r->blk_n < P25_BLOCK_DIBITS)
+			return;
+		p25_tsbk_t t;
+
+		r->blk_n = 0;
+		if (p25_tsbk_decode(r->blk, &t))
+			r->tsbk_ok++;
+		else
+			r->tsbk_bad++;
+		r->tsbk_fn(&t, r->blk_idx, &r->cur, r->tsbk_ctx);
+		// the last-block flag counts only on a block that passed its CRC; three is the most a unit holds
+		if ((t.crc_ok && t.lb) || ++r->blk_idx >= 3) {
+			r->locked = false;
+			r->in_blocks = false;
 		}
 		return;
 	}
@@ -151,9 +175,17 @@ static void symbol_period(p25_rx_t *r)
 		r->amp = bamp;
 		r->score_q8 = (uint16_t)best;
 		r->got = 0;
+		r->nid_n = 0;
 		r->nid = 0;
+		r->in_blocks = false;
 		r->syncs++;
 	}
+}
+
+void p25_rx_set_tsbk(p25_rx_t *r, p25_tsbk_fn fn, void *ctx)
+{
+	r->tsbk_fn = fn;
+	r->tsbk_ctx = ctx;
 }
 
 void p25_rx_feed(p25_rx_t *r, const int16_t *s, size_t n)
