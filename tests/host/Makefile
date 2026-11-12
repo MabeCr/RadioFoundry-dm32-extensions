@@ -568,6 +568,17 @@ run-ambe: ambeFecTest ambeVoiceTest micGainTest refTrimTest
 	./refTrimTest
 .PHONY: run-ambe
 
+# The P25 Phase 1 receiver core (core/p25): NID code and the sync / NID front end on synthetic C4FM
+TESTS   += p25Test
+
+p25Test: p25Test.c $(CORE)/p25/p25.c $(CORE)/p25/p25_rx.c $(wildcard $(CORE)/p25/*.h)
+	$(CC) $(CFLAGS) -Wshadow -o $@ p25Test.c $(CORE)/p25/p25.c $(CORE)/p25/p25_rx.c -lm
+
+run: run-p25
+run-p25: p25Test
+	./p25Test
+.PHONY: run-p25
+
 # The DMR voice call stack (core/dmr/call) against a simulated modem; LC coding cross-checked with sfr.c and dmrData.c
 CALL    := dmrCallTest.c sim/dmr_sim_modem.c $(CORE)/dmr/call/dmr_call.c $(CORE)/dmr/call/dmr_lc.c $(CORE)/dmr/sfr.c $(DATA) $(FRAME) \
            $(CORE)/dmr/dmrPrivacy.c $(CORE)/dmr/ambe/ambeFec.c

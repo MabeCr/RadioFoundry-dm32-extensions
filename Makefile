@@ -97,6 +97,9 @@ endif
 ifeq ($(CONFIG_SNMP),y)
 CORE_DIRS += core/snmp
 endif
+ifeq ($(CONFIG_P25),y)
+CORE_DIRS += core/p25
+endif
 ifeq ($(CONFIG_CRASH_LOG),y)
 CORE_DIRS += core/crash
 endif

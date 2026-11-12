@@ -258,6 +258,9 @@
 #ifndef CONFIG_APRS_RX
 #define CONFIG_APRS_RX			CONFIG_APRS
 #endif
+#ifndef CONFIG_P25
+#define CONFIG_P25			0
+#endif
 #ifndef CONFIG_APRS_IGATE
 #define CONFIG_APRS_IGATE		(CONFIG_APRS_RX && CONFIG_HOSTLINK)
 #endif

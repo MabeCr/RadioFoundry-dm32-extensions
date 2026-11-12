@@ -16,6 +16,7 @@ Past bugs, by subsystem: [gotchas.md](gotchas.md). Contributors read [docs/dev](
 | [radio-features.md](radio-features.md) | Scan, the FM transmit extras (tones, burst, roger beep), beeps, battery and power management |
 | [airband-and-broadcast.md](airband-and-broadcast.md) | Air band AM receive and broadcast FM receive, chosen by the frequency |
 | [aprs.md](aprs.md) | APRS on FM and over DMR |
+| [p25.md](p25.md) | P25 Phase 1 receive front end: sync search and NID decode |
 | [ui.md](ui.md) | The user interface as built: screens, keys, the drawing layer ([docs/ux](../ux/) has the design) |
 
 ## DMR
