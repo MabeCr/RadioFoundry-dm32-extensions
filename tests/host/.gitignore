@@ -12,3 +12,4 @@
 !/*.py
 !/*.awk
 !/watchdog_stub/
+!/p25_stub/
