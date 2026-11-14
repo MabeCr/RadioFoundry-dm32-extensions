@@ -571,13 +571,25 @@ run-ambe: ambeFecTest ambeVoiceTest micGainTest refTrimTest
 # The P25 Phase 1 receiver core (core/p25): NID code, data block coding and the sync / NID / TSBK front end on synthetic C4FM
 TESTS   += p25Test
 
-p25Test: p25Test.c $(wildcard $(CORE)/p25/*.c $(CORE)/p25/*.h)
-	$(CC) $(CFLAGS) -Wshadow -o $@ p25Test.c $(wildcard $(CORE)/p25/*.c) -lm
+p25Test: p25Test.c p25_synth.h $(wildcard $(CORE)/p25/*.c $(CORE)/p25/*.h)
+	$(CC) $(CFLAGS) -Wshadow -o $@ p25Test.c $(filter-out %/p25_listen.c,$(wildcard $(CORE)/p25/*.c)) -lm
 
 run: run-p25
 run-p25: p25Test
 	./p25Test
 .PHONY: run-p25
+
+# The P25 listener (core/p25/p25_listen.c) against a fake board audio tap; p25_stub/ holds the stand-in FreeRTOS header
+P25LST  := p25ListenTest.c $(wildcard $(CORE)/p25/*.c)
+TESTS   += p25ListenTest
+
+p25ListenTest: $(P25LST) $(wildcard $(CORE)/p25/*.h) p25_synth.h $(ROOT)/hal/hal_afsk.h $(wildcard p25_stub/*.h)
+	$(CC) $(CFLAGS) -Wshadow -DCONFIG_P25=1 -Ip25_stub -I$(ROOT)/hal -o $@ $(P25LST) -lm
+
+run: run-p25listen
+run-p25listen: p25ListenTest
+	./p25ListenTest
+.PHONY: run-p25listen
 
 # The DMR voice call stack (core/dmr/call) against a simulated modem; LC coding cross-checked with sfr.c and dmrData.c
 CALL    := dmrCallTest.c sim/dmr_sim_modem.c $(CORE)/dmr/call/dmr_call.c $(CORE)/dmr/call/dmr_lc.c $(CORE)/dmr/sfr.c $(DATA) $(FRAME) \

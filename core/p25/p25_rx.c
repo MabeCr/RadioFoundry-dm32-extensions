@@ -61,8 +61,19 @@ static int sync_score(const p25_rx_t *r, unsigned ph, int16_t *dc, int16_t *amp)
 		v[i] = r->hist[ph][(r->k - P25_SYNC_DIBITS + i) & 31];
 		sv += v[i];
 		ss += sync_sign(i);
-		svs += sync_sign(i) * v[i];
 	}
+	// A cheap screen before the fit: the sync's outer levels sit on the right side of the window's mean (its mean is
+	// above the middle, by about half the outer level, as most of the sync is positive). Random data fails it, and
+	// the fit's divisions run only for a candidate, not for every phase of every symbol
+	int32_t mean = sv / n;
+	unsigned match = 0;
+
+	for (unsigned i = 0; i < P25_SYNC_DIBITS; i++)
+		match += (v[i] > mean) == (sync_sign(i) > 0);
+	if (match < 22)
+		return 0;
+	for (unsigned i = 0; i < P25_SYNC_DIBITS; i++)
+		svs += sync_sign(i) * v[i];
 	int64_t a = ((svs * n - (int64_t)ss * sv)) / ((int64_t)n * n - (int64_t)ss * ss);
 
 	if (a <= 0)
@@ -80,6 +91,28 @@ static int sync_score(const p25_rx_t *r, unsigned ph, int16_t *dc, int16_t *amp)
 	int64_t sc = 256 - (res * 256) / (a * n);
 
 	return sc < 0 ? 0 : (int)sc;
+}
+
+// A word within 11 bits of a codeword is that codeword's (the code's distance is 23), so a word near one decoded
+// recently needs no search of the 65536 codewords; a control channel repeats a few of them over and over
+static bool nid_lookup(p25_rx_t *r, p25_frame_t *f)
+{
+	for (unsigned i = 0; i < P25_NID_CACHE; i++) {
+		if (r->nid_cache[i] == 0)
+			continue;
+		unsigned d = (unsigned)__builtin_popcountll(r->nid ^ r->nid_cache[i]);
+
+		if (d <= 11) {
+			f->nid.nac = (uint16_t)(r->nid_cache[i] >> 52);
+			f->nid.duid = (uint8_t)((r->nid_cache[i] >> 48) & 0xF);
+			f->nid.errors = (uint8_t)d;
+			return true;
+		}
+	}
+	if (!p25_nid_decode(r->nid, &f->nid))
+		return false;
+	r->nid_cache[r->nid_next++ % P25_NID_CACHE] = p25_nid_encode(f->nid.nac, f->nid.duid);
+	return true;
 }
 
 static void symbol_period(p25_rx_t *r)
@@ -113,7 +146,7 @@ static void symbol_period(p25_rx_t *r)
 			p25_frame_t *f = &r->cur;
 
 			r->locked = false;
-			if (!p25_nid_decode(r->nid, &f->nid)) {
+			if (!nid_lookup(r, f)) {
 				r->nid_bad++;
 				return;
 			}

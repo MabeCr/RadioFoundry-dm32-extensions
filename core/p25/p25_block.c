@@ -113,6 +113,7 @@ bool p25_tsbk_decode(const uint8_t dibits[P25_BLOCK_DIBITS], p25_tsbk_t *t)
 	t->opcode = b[0] & 0x3F;
 	t->mfid = b[1];
 	memcpy(t->args, b + 2, 8);
-	t->crc_ok = p25_crc16(b, 10) == (uint16_t)((b[10] << 8) | b[11]);
+	t->crc = (uint16_t)((b[10] << 8) | b[11]);
+	t->crc_ok = p25_crc16(b, 10) == t->crc;
 	return t->crc_ok;
 }

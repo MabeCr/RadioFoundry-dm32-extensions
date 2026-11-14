@@ -69,6 +69,7 @@ static void cw_cancel(radio_sm_t *sm);
 #if CONFIG_APRS
 #include "aprs/afsk.h"			// AFSK_BAUD, the tones
 #endif
+#include "p25/p25_listen.h"		// P25 listening (CONFIG_P25)
 
 // The radio's own DMR ID when the codeplug's general settings hold none (build value; 0 = refuse DMR transmit)
 #ifndef RADIO_DMR_ID_DEFAULT
@@ -5587,6 +5588,11 @@ static bool save_allowed(const radio_sm_t *sm, uint32_t now_ms)
 		return false;	// a sleeping receiver misses packets
 	}
 #endif
+#if CONFIG_P25
+	if (p25_listen_running()) {
+		return false;	// and its sync
+	}
+#endif
 #if CONFIG_SCAN
 	if (scan_on(&sm->scan)) {
 		return false;
@@ -5780,6 +5786,9 @@ void radio_sm_poll(radio_sm_t *sm, uint32_t now_ms)
 #endif
 #if CONFIG_APRS
 	aprs_poll(sm, now_ms);	// before battery saving: beacons are due while the receiver sleeps too
+#endif
+#if CONFIG_P25
+	p25_listen_tick(sm->view.ch.mode == RADIO_MODE_FM && !sm->hotspot && sm->view.state != RS_TX, now_ms);
 #endif
 	// The reference trim changed (RREQ_RETUNE): one tune once it has held still, so stepping it drops a reception once,
 	// not at every step. It waits for an APRS job; while transmitting or a hotspot, for the end of it

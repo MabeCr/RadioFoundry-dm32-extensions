@@ -19,6 +19,7 @@ typedef struct {
 	uint8_t opcode;		// 6 bits
 	uint8_t mfid;		// manufacturer ID, 0 = standard
 	uint8_t args[8];
+	uint16_t crc;		// as received
 	uint8_t crc_ok;
 	uint8_t errors;		// channel bits the trellis decoder had to change
 } p25_tsbk_t;

@@ -14,6 +14,7 @@
 #include "p25/p25_block.h"
 
 #define P25_RX_PHASES		8u
+#define P25_NID_CACHE		4u
 
 typedef struct {
 	p25_nid_t nid;
@@ -53,6 +54,8 @@ typedef struct {
 	void *tsbk_ctx;
 	uint32_t syncs, nid_ok, nid_bad, tsbk_ok, tsbk_bad;
 	uint32_t duid[16];	// frames by DUID
+	uint64_t nid_cache[P25_NID_CACHE];	// recently decoded NIDs as their codewords
+	uint8_t nid_next;
 } p25_rx_t;
 
 // False when the rate can't be handled (outside 7200..48000 Hz)

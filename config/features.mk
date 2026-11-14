@@ -420,6 +420,11 @@ ifneq ($(call feature_on,APRS_RX),)
     $(error CONFIG_APRS_RX=y needs CONFIG_APRS=y)
   endif
 endif
+ifneq ($(call feature_on,P25),)
+  ifeq ($(call feature_on,APRS_RX),)
+    $(error CONFIG_P25=y needs CONFIG_APRS_RX=y: its receive audio comes from the board's FM audio tap)
+  endif
+endif
 ifneq ($(call feature_on,APRS_IGATE),)
   ifeq ($(and $(call feature_on,APRS_RX),$(call feature_on,HOSTLINK)),)
     $(error CONFIG_APRS_IGATE=y needs CONFIG_APRS_RX=y and CONFIG_HOSTLINK=y)
