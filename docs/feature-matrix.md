@@ -79,7 +79,7 @@ is `tools/bringup.py list --radio <id>`.
 | `sfr_cwid` | not recorded | not recorded | not recorded | not recorded | ✕ | not recorded |
 | `aprs` | pass (seed) | not recorded | not recorded | not recorded | not recorded | not recorded |
 | `aprs_rx` | pass (seed) | not recorded | not recorded | not written | not written | not recorded |
-| `p25` | off | off | off | off | off | off |
+| `p25` | not recorded | off | off | off | off | off |
 | `aprs_igate` | not recorded | off | not recorded | not written | not written | off |
 | `gps_sky` | not recorded | not recorded | ✕ | not recorded | not recorded | not recorded |
 | `usb` | ✕ | pass (seed) | ✕ | ✕ | not recorded | not recorded |
@@ -249,7 +249,7 @@ clock`; ? = not known yet). No driver reads the clock yet ([radio-features.md](s
 | `CHANNEL_EDIT` | ● | ● | ● | ● | ● | ● |
 | `ZONE_EDIT` | ● | ● | ● | ● | ● | ● |
 | `CONTACT_EDIT` | ● | ● | ● | ● | ● | ● |
-| `P25` | ○ | ○ | ○ | ○ | ○ | ○ |
+| `P25` | ● | ○ | ○ | ○ | ○ | ○ |
 | Voltage reading (board, no switch) | Battery | Battery | Battery | None | Battery | Battery |
 | Clock kept through power-off (board, no switch) | Yes | ? | Yes | ? | ? | ? |
 <!-- end generated -->
