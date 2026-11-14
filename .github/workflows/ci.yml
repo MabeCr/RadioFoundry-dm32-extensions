@@ -180,4 +180,5 @@ jobs:
             build/ci/size-report.md
             build/ci/*.log
             build/ci/*/rfoundry_*.bin
+            build/ci/*.bin
           if-no-files-found: ignore
